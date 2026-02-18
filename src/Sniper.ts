@@ -12,7 +12,7 @@ import {
 import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
-  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
@@ -159,7 +159,7 @@ export class Sniper {
       });
 
       // Get token balance after buy (retry a few times for indexing delay)
-      const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+      const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
       let tokenBalance = 0;
       for (let i = 0; i < 3; i++) {
         try {
@@ -230,8 +230,8 @@ export class Sniper {
       );
     }
 
-    // Create ATA if needed
-    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+    // Create ATA if needed (Pump.fun uses Token-2022)
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
     const ataInfo = await this.connection.getAccountInfo(ata);
     if (!ataInfo) {
       tx.add(
@@ -239,7 +239,8 @@ export class Sniper {
           wallet.publicKey,
           ata,
           wallet.publicKey,
-          mint
+          mint,
+          TOKEN_2022_PROGRAM_ID
         )
       );
     }
@@ -260,7 +261,7 @@ export class Sniper {
 
     const associatedBondingCurve = launch.associatedBondingCurve
       ? new PublicKey(launch.associatedBondingCurve)
-      : await getAssociatedTokenAddress(mint, bondingCurve, true);
+      : await getAssociatedTokenAddress(mint, bondingCurve, true, TOKEN_2022_PROGRAM_ID);
 
     const buyIx = new TransactionInstruction({
       programId: PUMP_PROGRAM,
@@ -273,7 +274,7 @@ export class Sniper {
         { pubkey: ata, isSigner: false, isWritable: true },
         { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
         { pubkey: new PublicKey('SysvarRent111111111111111111111111111111111'), isSigner: false, isWritable: false },
         { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
         { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },

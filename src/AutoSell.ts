@@ -11,7 +11,7 @@ import {
 } from '@solana/web3.js';
 import {
   getAssociatedTokenAddress,
-  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
@@ -112,7 +112,7 @@ export class AutoSell {
     const mint = new PublicKey(position.token_mint);
     const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
 
-    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
     let currentBalance: number;
     try {
       const balanceResp = await this.connection.getTokenAccountBalance(ata);
@@ -153,7 +153,7 @@ export class AutoSell {
     const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
 
     // Get current token balance
-    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
     let currentBalance: number;
     try {
       const balanceResp = await this.connection.getTokenAccountBalance(ata);
@@ -316,11 +316,11 @@ export class AutoSell {
       );
     }
 
-    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
 
     // Derive bonding curve accounts
     const bondingCurve = deriveBondingCurve(mint);
-    const associatedBondingCurve = await getAssociatedTokenAddress(mint, bondingCurve, true);
+    const associatedBondingCurve = await getAssociatedTokenAddress(mint, bondingCurve, true, TOKEN_2022_PROGRAM_ID);
 
     // Encode sell instruction: discriminator + amount (u64) + minSolOutput (u64)
     const rawTokenAmount = BigInt(Math.floor(tokenAmount * 1e6));
@@ -343,7 +343,7 @@ export class AutoSell {
         { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
         { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
         { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
         { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
         { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
       ],
