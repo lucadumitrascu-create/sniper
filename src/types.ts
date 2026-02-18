@@ -71,4 +71,5 @@ export interface BondingCurveState {
   realSolReserves: bigint;
   tokenTotalSupply: bigint;
   complete: boolean;
+  creator: string; // base58 pubkey of token creator (offset 49 in account data)
 }

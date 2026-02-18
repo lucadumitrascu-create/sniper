@@ -12,7 +12,6 @@ import {
 import {
   getAssociatedTokenAddress,
   TOKEN_2022_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { CONFIG } from './config';
@@ -24,16 +23,22 @@ import {
   getUserConfig,
   log,
 } from './supabase';
-import { safeNum, deriveBondingCurve, estimateTokenValueSol } from './utils';
-
-const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
+import {
+  safeNum,
+  PUMP_PROGRAM,
+  PUMP_GLOBAL,
+  PUMP_FEE_RECIPIENT,
+  PUMP_EVENT_AUTHORITY,
+  PUMP_FEE_CONFIG,
+  PUMP_FEE_PROGRAM,
+  deriveBondingCurve,
+  deriveCreatorVault,
+  readBondingCurve,
+  estimateTokenValueSol,
+} from './utils';
 
 // Pump.fun "sell" instruction discriminator
 const SELL_DISCRIMINATOR = Buffer.from([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]);
-
-const PUMP_GLOBAL = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
-const PUMP_FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbCJ83zX7FnHR1');
-const PUMP_EVENT_AUTHORITY = new PublicKey('Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1');
 
 export class AutoSell {
   private connection: Connection;
@@ -99,9 +104,6 @@ export class AutoSell {
     }
   }
 
-  /**
-   * Manual sell: user sets force_sell=true from dashboard, bot sells immediately.
-   */
   private async executeManualSell(position: SniperPosition): Promise<void> {
     const config = await getUserConfig(position.user_id);
     if (!config) {
@@ -159,7 +161,6 @@ export class AutoSell {
       const balanceResp = await this.connection.getTokenAccountBalance(ata);
       currentBalance = safeNum(balanceResp.value.uiAmount, 0);
     } catch {
-      // Token account might be closed
       await updatePosition(position.id, { status: 'closed', closed_at: new Date().toISOString() });
       return;
     }
@@ -179,11 +180,9 @@ export class AutoSell {
       : 0;
     const currentPrice = currentBalance > 0 ? currentValueSol / currentBalance : 0;
 
-    // Guard against NaN in DB update
     const safePnl = Number.isFinite(pnlPct) ? pnlPct : 0;
     const safePrice = Number.isFinite(currentPrice) ? currentPrice : 0;
 
-    // Update position with current data
     await updatePosition(position.id, {
       current_price_sol: safePrice,
       pnl_pct: safePnl,
@@ -223,12 +222,18 @@ export class AutoSell {
     tokenAmount: number,
     reason: 'take_profit' | 'stop_loss' | 'manual'
   ): Promise<void> {
-    // Mark as selling to prevent duplicate sells
     await updatePosition(position.id, { status: 'selling', force_sell: false });
 
     try {
       const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
       const mint = new PublicKey(position.token_mint);
+
+      // Read bonding curve to get creator for creatorVault PDA
+      const curve = await readBondingCurve(this.connection, mint);
+      if (!curve) {
+        throw new Error('Could not read bonding curve to derive creatorVault');
+      }
+      const creator = new PublicKey(curve.creator);
 
       const slippageBps = safeNum(config.slippage_bps, 500);
       const priorityFee = safeNum(config.priority_fee_lamports, 100000);
@@ -236,6 +241,7 @@ export class AutoSell {
       const tx = await this.buildSellTransaction(
         wallet,
         mint,
+        creator,
         tokenAmount,
         slippageBps,
         priorityFee
@@ -284,7 +290,6 @@ export class AutoSell {
         { positionId: position.id, signature, soldAmountSol, finalPnl: safeFinalPnl, reason }
       );
     } catch (err: any) {
-      // Revert status to open so we can retry
       await updatePosition(position.id, { status: 'open' });
       await log(
         config.user_id,
@@ -295,9 +300,31 @@ export class AutoSell {
     }
   }
 
+  /**
+   * Build Pump.fun sell transaction with all 14 required accounts.
+   *
+   * Account layout:
+   *   0  global                  (read)
+   *   1  feeRecipient            (write)
+   *   2  mint                    (read)
+   *   3  bondingCurve            (write)
+   *   4  associatedBondingCurve  (write)
+   *   5  associatedUser          (write)  - user's ATA
+   *   6  user                    (write, signer)
+   *   7  systemProgram           (read)
+   *   8  creatorVault            (write)
+   *   9  tokenProgram            (read)  - Token-2022
+   *  10  eventAuthority          (read)
+   *  11  program                 (read)  - Pump program
+   *  12  feeConfig               (read)
+   *  13  feeProgram              (read)
+   *
+   * Data: discriminator(8) + amount(u64) + minSolOutput(u64)
+   */
   private async buildSellTransaction(
     wallet: Keypair,
     mint: PublicKey,
+    creator: PublicKey,
     tokenAmount: number,
     slippageBps: number,
     priorityFeeLamports: number
@@ -311,18 +338,20 @@ export class AutoSell {
           microLamports: priorityFeeLamports,
         }),
         ComputeBudgetProgram.setComputeUnitLimit({
-          units: 250_000,
+          units: 300_000,
         })
       );
     }
 
     const ata = await getAssociatedTokenAddress(mint, wallet.publicKey, false, TOKEN_2022_PROGRAM_ID);
 
-    // Derive bonding curve accounts
+    // Derive all required accounts
     const bondingCurve = deriveBondingCurve(mint);
     const associatedBondingCurve = await getAssociatedTokenAddress(mint, bondingCurve, true, TOKEN_2022_PROGRAM_ID);
+    const creatorVault = deriveCreatorVault(creator);
 
-    // Encode sell instruction: discriminator + amount (u64) + minSolOutput (u64)
+    // Encode sell instruction data (24 bytes):
+    // discriminator(8) + amount(u64) + minSolOutput(u64)
     const rawTokenAmount = BigInt(Math.floor(tokenAmount * 1e6));
     const minSolOutput = BigInt(0);
 
@@ -334,18 +363,20 @@ export class AutoSell {
     const sellIx = new TransactionInstruction({
       programId: PUMP_PROGRAM,
       keys: [
-        { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-        { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
-        { pubkey: mint, isSigner: false, isWritable: false },
-        { pubkey: bondingCurve, isSigner: false, isWritable: true },
-        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
-        { pubkey: ata, isSigner: false, isWritable: true },
-        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-        { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },                // 0  global
+        { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },           // 1  feeRecipient
+        { pubkey: mint, isSigner: false, isWritable: false },                        // 2  mint
+        { pubkey: bondingCurve, isSigner: false, isWritable: true },                 // 3  bondingCurve
+        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },       // 4  associatedBondingCurve
+        { pubkey: ata, isSigner: false, isWritable: true },                          // 5  associatedUser
+        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },              // 6  user
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },     // 7  systemProgram
+        { pubkey: creatorVault, isSigner: false, isWritable: true },                 // 8  creatorVault
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },       // 9  tokenProgram
+        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },        // 10 eventAuthority
+        { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },                // 11 program
+        { pubkey: PUMP_FEE_CONFIG, isSigner: false, isWritable: false },             // 12 feeConfig
+        { pubkey: PUMP_FEE_PROGRAM, isSigner: false, isWritable: false },            // 13 feeProgram
       ],
       data,
     });

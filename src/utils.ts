@@ -2,22 +2,142 @@ import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
 import { SniperConfig, BondingCurveState } from './types';
 import { CONFIG } from './config';
 
-const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
+// ──────────────────────────────────────────────
+// Pump.fun program constants
+// ──────────────────────────────────────────────
+
+export const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
+export const PUMP_FEE_PROGRAM = new PublicKey('pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ');
+export const PUMP_FEE_RECIPIENT = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
+
+// Static PDAs (derived once, never change)
+export const PUMP_GLOBAL = PublicKey.findProgramAddressSync(
+  [Buffer.from('global')],
+  PUMP_PROGRAM
+)[0];
+
+export const PUMP_EVENT_AUTHORITY = PublicKey.findProgramAddressSync(
+  [Buffer.from('__event_authority')],
+  PUMP_PROGRAM
+)[0];
+
+export const PUMP_GLOBAL_VOLUME_ACCUMULATOR = PublicKey.findProgramAddressSync(
+  [Buffer.from('global_volume_accumulator')],
+  PUMP_PROGRAM
+)[0];
+
+export const PUMP_FEE_CONFIG = PublicKey.findProgramAddressSync(
+  [Buffer.from('fee_config'), PUMP_PROGRAM.toBuffer()],
+  PUMP_FEE_PROGRAM
+)[0];
+
+// ──────────────────────────────────────────────
+// PDA derivation helpers
+// ──────────────────────────────────────────────
+
+export function deriveBondingCurve(mint: PublicKey): PublicKey {
+  const [bondingCurve] = PublicKey.findProgramAddressSync(
+    [Buffer.from('bonding-curve'), mint.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return bondingCurve;
+}
+
+export function deriveCreatorVault(creator: PublicKey): PublicKey {
+  const [creatorVault] = PublicKey.findProgramAddressSync(
+    [Buffer.from('creator-vault'), creator.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return creatorVault;
+}
+
+export function deriveUserVolumeAccumulator(user: PublicKey): PublicKey {
+  const [pda] = PublicKey.findProgramAddressSync(
+    [Buffer.from('user_volume_accumulator'), user.toBuffer()],
+    PUMP_PROGRAM
+  );
+  return pda;
+}
+
+// ──────────────────────────────────────────────
+// Bonding curve reader
+// ──────────────────────────────────────────────
 
 /**
- * Safely parse a value to number. Supabase returns NUMERIC columns as strings.
- * Prevents NaN propagation by returning a fallback for any non-finite result.
+ * Read bonding curve state from on-chain account.
+ *
+ * Account data layout (after 8-byte Anchor discriminator):
+ *   offset  8: virtualTokenReserves  (u64)
+ *   offset 16: virtualSolReserves    (u64)
+ *   offset 24: realTokenReserves     (u64)
+ *   offset 32: realSolReserves       (u64)
+ *   offset 40: tokenTotalSupply      (u64)
+ *   offset 48: complete              (bool, 1 byte)
+ *   offset 49: creator               (Pubkey, 32 bytes)
  */
+export async function readBondingCurve(
+  connection: Connection,
+  mint: PublicKey
+): Promise<BondingCurveState | null> {
+  const bondingCurve = deriveBondingCurve(mint);
+  const accountInfo = await connection.getAccountInfo(bondingCurve);
+  if (!accountInfo || !accountInfo.data || accountInfo.data.length < 81) return null;
+
+  const data = accountInfo.data;
+  const creatorBytes = data.subarray(49, 81);
+
+  return {
+    virtualTokenReserves: data.readBigUInt64LE(8),
+    virtualSolReserves: data.readBigUInt64LE(16),
+    realTokenReserves: data.readBigUInt64LE(24),
+    realSolReserves: data.readBigUInt64LE(32),
+    tokenTotalSupply: data.readBigUInt64LE(40),
+    complete: data[48] !== 0,
+    creator: new PublicKey(creatorBytes).toBase58(),
+  };
+}
+
+// ──────────────────────────────────────────────
+// Value estimation
+// ──────────────────────────────────────────────
+
+export async function estimateTokenValueSol(
+  connection: Connection,
+  mint: PublicKey,
+  tokenAmount: number
+): Promise<number | null> {
+  const curve = await readBondingCurve(connection, mint);
+  if (!curve || curve.virtualTokenReserves === 0n) return null;
+
+  const virtualTokenReserves = Number(curve.virtualTokenReserves);
+  const virtualSolReserves = Number(curve.virtualSolReserves);
+
+  const rawTokenAmount = tokenAmount * 1e6;
+  const valueLamports = (rawTokenAmount * virtualSolReserves) / virtualTokenReserves;
+  return valueLamports / LAMPORTS_PER_SOL;
+}
+
+export function getMarketCapSol(curve: BondingCurveState): number {
+  if (curve.virtualTokenReserves === 0n) return 0;
+  const price = Number(curve.virtualSolReserves) / Number(curve.virtualTokenReserves);
+  const totalSupply = Number(curve.tokenTotalSupply);
+  return (totalSupply * price) / LAMPORTS_PER_SOL;
+}
+
+export function getLiquiditySol(curve: BondingCurveState): number {
+  return Number(curve.realSolReserves) / LAMPORTS_PER_SOL;
+}
+
+// ──────────────────────────────────────────────
+// Misc utilities
+// ──────────────────────────────────────────────
+
 export function safeNum(value: unknown, fallback: number = 0): number {
   if (value === null || value === undefined) return fallback;
   const n = Number(value);
   return Number.isFinite(n) ? n : fallback;
 }
 
-/**
- * Normalize a SniperConfig from Supabase, converting all numeric fields
- * from potential string values to proper numbers with safe defaults.
- */
 export function normalizeConfig(raw: Record<string, unknown>): SniperConfig {
   return {
     id: String(raw.id || ''),
@@ -41,86 +161,6 @@ export function normalizeConfig(raw: Record<string, unknown>): SniperConfig {
     created_at: String(raw.created_at || ''),
     updated_at: String(raw.updated_at || ''),
   };
-}
-
-/**
- * Derive the bonding curve PDA for a given mint.
- */
-export function deriveBondingCurve(mint: PublicKey): PublicKey {
-  const [bondingCurve] = PublicKey.findProgramAddressSync(
-    [Buffer.from('bonding-curve'), mint.toBuffer()],
-    PUMP_PROGRAM
-  );
-  return bondingCurve;
-}
-
-/**
- * Read bonding curve state from on-chain account.
- * Layout after 8-byte discriminator:
- *   virtualTokenReserves: u64 (offset 8)
- *   virtualSolReserves: u64 (offset 16)
- *   realTokenReserves: u64 (offset 24)
- *   realSolReserves: u64 (offset 32)
- *   tokenTotalSupply: u64 (offset 40)
- *   complete: bool (offset 48)
- */
-export async function readBondingCurve(
-  connection: Connection,
-  mint: PublicKey
-): Promise<BondingCurveState | null> {
-  const bondingCurve = deriveBondingCurve(mint);
-  const accountInfo = await connection.getAccountInfo(bondingCurve);
-  if (!accountInfo || !accountInfo.data || accountInfo.data.length < 49) return null;
-
-  const data = accountInfo.data;
-  return {
-    virtualTokenReserves: data.readBigUInt64LE(8),
-    virtualSolReserves: data.readBigUInt64LE(16),
-    realTokenReserves: data.readBigUInt64LE(24),
-    realSolReserves: data.readBigUInt64LE(32),
-    tokenTotalSupply: data.readBigUInt64LE(40),
-    complete: data[48] !== 0,
-  };
-}
-
-/**
- * Estimate the SOL value of a token amount using bonding curve reserves.
- * Returns null if bonding curve can't be read.
- */
-export async function estimateTokenValueSol(
-  connection: Connection,
-  mint: PublicKey,
-  tokenAmount: number
-): Promise<number | null> {
-  const curve = await readBondingCurve(connection, mint);
-  if (!curve || curve.virtualTokenReserves === 0n) return null;
-
-  const virtualTokenReserves = Number(curve.virtualTokenReserves);
-  const virtualSolReserves = Number(curve.virtualSolReserves);
-
-  // token amounts are in raw units (6 decimals for pump.fun)
-  const rawTokenAmount = tokenAmount * 1e6;
-  const valueLamports = (rawTokenAmount * virtualSolReserves) / virtualTokenReserves;
-  return valueLamports / LAMPORTS_PER_SOL;
-}
-
-/**
- * Get market cap in SOL from bonding curve state.
- * Market cap = totalSupply * pricePerToken
- * pricePerToken = virtualSolReserves / virtualTokenReserves
- */
-export function getMarketCapSol(curve: BondingCurveState): number {
-  if (curve.virtualTokenReserves === 0n) return 0;
-  const price = Number(curve.virtualSolReserves) / Number(curve.virtualTokenReserves);
-  const totalSupply = Number(curve.tokenTotalSupply);
-  return (totalSupply * price) / LAMPORTS_PER_SOL;
-}
-
-/**
- * Get liquidity (real SOL reserves) from bonding curve.
- */
-export function getLiquiditySol(curve: BondingCurveState): number {
-  return Number(curve.realSolReserves) / LAMPORTS_PER_SOL;
 }
 
 export function sleep(ms: number): Promise<void> {

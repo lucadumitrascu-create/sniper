@@ -13,7 +13,6 @@ import {
   getAssociatedTokenAddress,
   createAssociatedTokenAccountInstruction,
   TOKEN_2022_PROGRAM_ID,
-  ASSOCIATED_TOKEN_PROGRAM_ID,
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { CONFIG } from './config';
@@ -21,22 +20,24 @@ import { SniperConfig, PumpTokenLaunch, SniperPosition } from './types';
 import { insertPosition, log, getOpenPositions, trackDailySpend } from './supabase';
 import {
   safeNum,
+  PUMP_PROGRAM,
+  PUMP_GLOBAL,
+  PUMP_FEE_RECIPIENT,
+  PUMP_EVENT_AUTHORITY,
+  PUMP_GLOBAL_VOLUME_ACCUMULATOR,
+  PUMP_FEE_CONFIG,
+  PUMP_FEE_PROGRAM,
   deriveBondingCurve,
+  deriveCreatorVault,
+  deriveUserVolumeAccumulator,
   readBondingCurve,
   getMarketCapSol,
   getLiquiditySol,
   sleep,
 } from './utils';
 
-const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
-
 // Pump.fun "buy" instruction discriminator
 const BUY_DISCRIMINATOR = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
-
-// Pump.fun global state account
-const PUMP_GLOBAL = new PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
-const PUMP_FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbCJ83zX7FnHR1');
-const PUMP_EVENT_AUTHORITY = new PublicKey('Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F1');
 
 export class Sniper {
   private connection: Connection;
@@ -90,37 +91,39 @@ export class Sniper {
       }
     }
 
-    // Market cap + liquidity filters (read bonding curve on-chain)
+    // Always read bonding curve: needed for creator (creatorVault PDA) and optional filters
     const mint = new PublicKey(mintKey);
+    const curve = await readBondingCurve(this.connection, mint);
+    if (!curve) {
+      await log(userId, 'error', `Could not read bonding curve for ${launch.symbol}, cannot derive accounts`);
+      return null;
+    }
+
+    if (curve.complete) {
+      await log(userId, 'warn', `Bonding curve already complete for ${launch.symbol}, skipping`);
+      return null;
+    }
+
+    // Market cap + liquidity filters
     const hasFilters = userConfig.min_market_cap_sol > 0
       || userConfig.max_market_cap_sol > 0
       || userConfig.min_liquidity_sol > 0;
 
     if (hasFilters) {
-      const curve = await readBondingCurve(this.connection, mint);
-      if (!curve) {
-        await log(userId, 'warn', `Could not read bonding curve for ${launch.symbol}, skipping filter check`);
-      } else {
-        if (curve.complete) {
-          await log(userId, 'warn', `Bonding curve already complete for ${launch.symbol}, skipping`);
-          return null;
-        }
+      const mcap = getMarketCapSol(curve);
+      const liquidity = getLiquiditySol(curve);
 
-        const mcap = getMarketCapSol(curve);
-        const liquidity = getLiquiditySol(curve);
-
-        if (userConfig.min_market_cap_sol > 0 && mcap < userConfig.min_market_cap_sol) {
-          await log(userId, 'info', `Market cap ${mcap.toFixed(2)} SOL < min ${userConfig.min_market_cap_sol} SOL, skipping ${launch.symbol}`);
-          return null;
-        }
-        if (userConfig.max_market_cap_sol > 0 && mcap > userConfig.max_market_cap_sol) {
-          await log(userId, 'info', `Market cap ${mcap.toFixed(2)} SOL > max ${userConfig.max_market_cap_sol} SOL, skipping ${launch.symbol}`);
-          return null;
-        }
-        if (userConfig.min_liquidity_sol > 0 && liquidity < userConfig.min_liquidity_sol) {
-          await log(userId, 'info', `Liquidity ${liquidity.toFixed(4)} SOL < min ${userConfig.min_liquidity_sol} SOL, skipping ${launch.symbol}`);
-          return null;
-        }
+      if (userConfig.min_market_cap_sol > 0 && mcap < userConfig.min_market_cap_sol) {
+        await log(userId, 'info', `Market cap ${mcap.toFixed(2)} SOL < min ${userConfig.min_market_cap_sol} SOL, skipping ${launch.symbol}`);
+        return null;
+      }
+      if (userConfig.max_market_cap_sol > 0 && mcap > userConfig.max_market_cap_sol) {
+        await log(userId, 'info', `Market cap ${mcap.toFixed(2)} SOL > max ${userConfig.max_market_cap_sol} SOL, skipping ${launch.symbol}`);
+        return null;
+      }
+      if (userConfig.min_liquidity_sol > 0 && liquidity < userConfig.min_liquidity_sol) {
+        await log(userId, 'info', `Liquidity ${liquidity.toFixed(4)} SOL < min ${userConfig.min_liquidity_sol} SOL, skipping ${launch.symbol}`);
+        return null;
       }
     }
 
@@ -135,6 +138,7 @@ export class Sniper {
       });
 
       const wallet = Keypair.fromSecretKey(bs58.decode(userConfig.bot_wallet_private_key));
+      const creator = new PublicKey(curve.creator);
 
       const slippageBps = safeNum(userConfig.slippage_bps, 500);
       const priorityFee = safeNum(userConfig.priority_fee_lamports, 100000);
@@ -143,6 +147,7 @@ export class Sniper {
         wallet,
         mint,
         launch,
+        creator,
         buyAmountSol,
         slippageBps,
         priorityFee
@@ -208,10 +213,34 @@ export class Sniper {
     }
   }
 
+  /**
+   * Build Pump.fun buy transaction with all 16 required accounts.
+   *
+   * Account layout:
+   *   0  global                    (read)
+   *   1  feeRecipient              (write)
+   *   2  mint                      (read)
+   *   3  bondingCurve              (write)
+   *   4  associatedBondingCurve    (write)
+   *   5  associatedUser            (write)  - user's ATA
+   *   6  user                      (write, signer)
+   *   7  systemProgram             (read)
+   *   8  tokenProgram              (read)  - Token-2022
+   *   9  creatorVault              (write)
+   *  10  eventAuthority            (read)
+   *  11  program                   (read)  - Pump program
+   *  12  globalVolumeAccumulator   (read)
+   *  13  userVolumeAccumulator     (write)
+   *  14  feeConfig                 (read)
+   *  15  feeProgram                (read)
+   *
+   * Data: discriminator(8) + amount(u64) + maxSolCost(u64) + trackVolume(u8)
+   */
   private async buildBuyTransaction(
     wallet: Keypair,
     mint: PublicKey,
     launch: PumpTokenLaunch,
+    creator: PublicKey,
     buyAmountSol: number,
     slippageBps: number,
     priorityFeeLamports: number
@@ -225,7 +254,7 @@ export class Sniper {
           microLamports: priorityFeeLamports,
         }),
         ComputeBudgetProgram.setComputeUnitLimit({
-          units: 250_000,
+          units: 300_000,
         })
       );
     }
@@ -245,16 +274,19 @@ export class Sniper {
       );
     }
 
-    // Compute SOL amounts safely (all values are guaranteed finite by safeNum upstream)
+    // Compute SOL amounts safely
     const buyAmountLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
     const maxSolCost = buyAmountLamports + Math.floor(buyAmountLamports * slippageBps / 10000);
 
-    // Encode buy instruction data: discriminator (8) + tokenAmount (u64) + maxSolCost (u64)
-    const data = Buffer.alloc(24);
+    // Encode buy instruction data (25 bytes):
+    // discriminator(8) + amount(u64) + maxSolCost(u64) + trackVolume(u8)
+    const data = Buffer.alloc(25);
     BUY_DISCRIMINATOR.copy(data, 0);
-    data.writeBigUInt64LE(BigInt(0), 8); // 0 = buy as much as possible with SOL
+    data.writeBigUInt64LE(BigInt(0), 8);           // 0 = buy as much as possible with SOL
     data.writeBigUInt64LE(BigInt(maxSolCost), 16);
+    data.writeUInt8(0, 24);                         // trackVolume = false
 
+    // Derive all required accounts
     const bondingCurve = launch.bondingCurve
       ? new PublicKey(launch.bondingCurve)
       : deriveBondingCurve(mint);
@@ -263,21 +295,28 @@ export class Sniper {
       ? new PublicKey(launch.associatedBondingCurve)
       : await getAssociatedTokenAddress(mint, bondingCurve, true, TOKEN_2022_PROGRAM_ID);
 
+    const creatorVault = deriveCreatorVault(creator);
+    const userVolumeAccumulator = deriveUserVolumeAccumulator(wallet.publicKey);
+
     const buyIx = new TransactionInstruction({
       programId: PUMP_PROGRAM,
       keys: [
-        { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },
-        { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },
-        { pubkey: mint, isSigner: false, isWritable: false },
-        { pubkey: bondingCurve, isSigner: false, isWritable: true },
-        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },
-        { pubkey: ata, isSigner: false, isWritable: true },
-        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },
-        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },
-        { pubkey: new PublicKey('SysvarRent111111111111111111111111111111111'), isSigner: false, isWritable: false },
-        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-        { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },
+        { pubkey: PUMP_GLOBAL, isSigner: false, isWritable: false },                      // 0  global
+        { pubkey: PUMP_FEE_RECIPIENT, isSigner: false, isWritable: true },                 // 1  feeRecipient
+        { pubkey: mint, isSigner: false, isWritable: false },                              // 2  mint
+        { pubkey: bondingCurve, isSigner: false, isWritable: true },                       // 3  bondingCurve
+        { pubkey: associatedBondingCurve, isSigner: false, isWritable: true },             // 4  associatedBondingCurve
+        { pubkey: ata, isSigner: false, isWritable: true },                                // 5  associatedUser
+        { pubkey: wallet.publicKey, isSigner: true, isWritable: true },                    // 6  user
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },           // 7  systemProgram
+        { pubkey: TOKEN_2022_PROGRAM_ID, isSigner: false, isWritable: false },             // 8  tokenProgram
+        { pubkey: creatorVault, isSigner: false, isWritable: true },                       // 9  creatorVault
+        { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },              // 10 eventAuthority
+        { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },                      // 11 program
+        { pubkey: PUMP_GLOBAL_VOLUME_ACCUMULATOR, isSigner: false, isWritable: false },    // 12 globalVolumeAccumulator
+        { pubkey: userVolumeAccumulator, isSigner: false, isWritable: true },              // 13 userVolumeAccumulator
+        { pubkey: PUMP_FEE_CONFIG, isSigner: false, isWritable: false },                   // 14 feeConfig
+        { pubkey: PUMP_FEE_PROGRAM, isSigner: false, isWritable: false },                  // 15 feeProgram
       ],
       data,
     });
