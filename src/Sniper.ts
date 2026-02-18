@@ -16,7 +16,7 @@ import {
 } from '@solana/spl-token';
 import bs58 from 'bs58';
 import { CONFIG } from './config';
-import { SniperConfig, PumpTokenLaunch, SniperPosition } from './types';
+import { SniperConfig, PumpTokenLaunch, SniperPosition, BondingCurveState } from './types';
 import { insertPosition, log, getOpenPositions, trackDailySpend } from './supabase';
 import {
   safeNum,
@@ -131,23 +131,28 @@ export class Sniper {
     this.activeSnipes.set(mintKey, true);
 
     try {
-      await log(userId, 'info', `Sniping ${launch.symbol} (${mintKey}) with ${buyAmountSol} SOL`, {
-        mint: mintKey,
-        symbol: launch.symbol,
-        buyAmount: buyAmountSol,
-      });
-
       const wallet = Keypair.fromSecretKey(bs58.decode(userConfig.bot_wallet_private_key));
       const creator = new PublicKey(curve.creator);
 
       const slippageBps = safeNum(userConfig.slippage_bps, 500);
       const priorityFee = safeNum(userConfig.priority_fee_lamports, 100000);
 
+      await log(userId, 'info', `Sniping ${launch.symbol} (${mintKey}) with ${buyAmountSol} SOL | slippage=${slippageBps}bps | priorityFee=${priorityFee}`, {
+        mint: mintKey,
+        symbol: launch.symbol,
+        buyAmount: buyAmountSol,
+        slippageBps,
+        priorityFeeLamports: priorityFee,
+        virtualTokenReserves: curve.virtualTokenReserves.toString(),
+        virtualSolReserves: curve.virtualSolReserves.toString(),
+      });
+
       const tx = await this.buildBuyTransaction(
         wallet,
         mint,
         launch,
         creator,
+        curve,
         buyAmountSol,
         slippageBps,
         priorityFee
@@ -241,6 +246,7 @@ export class Sniper {
     mint: PublicKey,
     launch: PumpTokenLaunch,
     creator: PublicKey,
+    curve: BondingCurveState,
     buyAmountSol: number,
     slippageBps: number,
     priorityFeeLamports: number
@@ -278,13 +284,33 @@ export class Sniper {
     const buyAmountLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
     const maxSolCost = buyAmountLamports + Math.floor(buyAmountLamports * slippageBps / 10000);
 
+    // Calculate expected token amount from bonding curve reserves
+    // Formula: tokensOut = (solIn * virtualTokenReserves) / (virtualSolReserves + solIn)
+    const solIn = BigInt(buyAmountLamports);
+    const expectedTokens = (solIn * curve.virtualTokenReserves) / (curve.virtualSolReserves + solIn);
+
+    // Apply slippage downward: accept fewer tokens to account for price movement
+    const minTokenAmount = expectedTokens * BigInt(10000 - slippageBps) / BigInt(10000);
+
+    if (minTokenAmount <= 0n) {
+      throw new Error(
+        `Calculated token amount is 0. buyAmountLamports=${buyAmountLamports}, ` +
+        `virtualTokenReserves=${curve.virtualTokenReserves}, virtualSolReserves=${curve.virtualSolReserves}`
+      );
+    }
+
+    // Debug: log all computed values before building instruction
+    console.log(`[DEBUG] buy_amount_sol=${buyAmountSol}, lamports=${buyAmountLamports}, maxSolCost=${maxSolCost}`);
+    console.log(`[DEBUG] virtualTokenReserves=${curve.virtualTokenReserves}, virtualSolReserves=${curve.virtualSolReserves}`);
+    console.log(`[DEBUG] expectedTokens=${expectedTokens}, minTokenAmount (after slippage)=${minTokenAmount}`);
+
     // Encode buy instruction data (25 bytes):
     // discriminator(8) + amount(u64) + maxSolCost(u64) + trackVolume(u8)
     const data = Buffer.alloc(25);
     BUY_DISCRIMINATOR.copy(data, 0);
-    data.writeBigUInt64LE(BigInt(0), 8);           // 0 = buy as much as possible with SOL
-    data.writeBigUInt64LE(BigInt(maxSolCost), 16);
-    data.writeUInt8(0, 24);                         // trackVolume = false
+    data.writeBigUInt64LE(minTokenAmount, 8);       // token amount to buy (must be > 0)
+    data.writeBigUInt64LE(BigInt(maxSolCost), 16);  // max SOL willing to pay (with slippage)
+    data.writeUInt8(0, 24);                          // trackVolume = false
 
     // Derive all required accounts
     const bondingCurve = launch.bondingCurve
