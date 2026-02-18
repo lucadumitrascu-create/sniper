@@ -11,6 +11,13 @@ export interface SniperConfig {
   priority_fee_lamports: number;
   bot_wallet_address: string;
   bot_wallet_private_key: string;
+  // Filters
+  min_market_cap_sol: number;
+  max_market_cap_sol: number;
+  min_liquidity_sol: number;
+  daily_budget_sol: number;
+  daily_spent_sol: number;
+  budget_reset_at: string;
   created_at: string;
   updated_at: string;
 }
@@ -27,6 +34,7 @@ export interface SniperPosition {
   current_price_sol: number;
   pnl_pct: number;
   status: 'open' | 'closed' | 'selling';
+  force_sell: boolean;
   tx_signature_buy: string;
   tx_signature_sell: string | null;
   sold_amount_sol: number | null;
@@ -53,4 +61,14 @@ export interface PumpTokenLaunch {
   associatedBondingCurve: string;
   creator: string;
   timestamp: number;
+}
+
+/** Bonding curve state read from on-chain account */
+export interface BondingCurveState {
+  virtualTokenReserves: bigint;
+  virtualSolReserves: bigint;
+  realTokenReserves: bigint;
+  realSolReserves: bigint;
+  tokenTotalSupply: bigint;
+  complete: boolean;
 }

@@ -12,6 +12,14 @@ CREATE TABLE IF NOT EXISTS sniper_config (
   priority_fee_lamports BIGINT DEFAULT 100000,
   bot_wallet_address TEXT NOT NULL,
   bot_wallet_private_key TEXT NOT NULL,
+  -- Filters
+  min_market_cap_sol NUMERIC(14, 4) DEFAULT 0,
+  max_market_cap_sol NUMERIC(14, 4) DEFAULT 0,
+  min_liquidity_sol NUMERIC(14, 4) DEFAULT 0,
+  -- Budget
+  daily_budget_sol NUMERIC(10, 4) DEFAULT 0,
+  daily_spent_sol NUMERIC(10, 4) DEFAULT 0,
+  budget_reset_at TIMESTAMPTZ DEFAULT now(),
   created_at TIMESTAMPTZ DEFAULT now(),
   updated_at TIMESTAMPTZ DEFAULT now(),
   UNIQUE(user_id)
@@ -30,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sniper_positions (
   current_price_sol NUMERIC(20, 10) DEFAULT 0,
   pnl_pct NUMERIC(10, 2) DEFAULT 0,
   status TEXT DEFAULT 'open' CHECK (status IN ('open', 'closed', 'selling')),
+  force_sell BOOLEAN DEFAULT false,
   tx_signature_buy TEXT,
   tx_signature_sell TEXT,
   sold_amount_sol NUMERIC(10, 6),
@@ -79,11 +88,12 @@ CREATE POLICY "Users can view own positions"
   ON sniper_positions FOR SELECT
   USING (auth.uid() = user_id);
 
--- Logs policies
-CREATE POLICY "Users can view own logs"
-  ON sniper_positions FOR SELECT
+-- Positions: allow user to update force_sell
+CREATE POLICY "Users can update own positions"
+  ON sniper_positions FOR UPDATE
   USING (auth.uid() = user_id);
 
+-- Logs policies
 CREATE POLICY "Users can view own sniper logs"
   ON sniper_logs FOR SELECT
   USING (auth.uid() = user_id);

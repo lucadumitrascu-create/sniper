@@ -17,7 +17,14 @@ import {
 import bs58 from 'bs58';
 import { CONFIG } from './config';
 import { SniperConfig, SniperPosition } from './types';
-import { getAllOpenPositions, updatePosition, getUserConfig, log } from './supabase';
+import {
+  getAllOpenPositions,
+  getForceSellPositions,
+  updatePosition,
+  getUserConfig,
+  log,
+} from './supabase';
+import { safeNum, deriveBondingCurve, estimateTokenValueSol } from './utils';
 
 const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
 
@@ -66,11 +73,23 @@ export class AutoSell {
   }
 
   private async checkPositions(): Promise<void> {
+    // 1. Process manual (force) sells first
+    const forceSells = await getForceSellPositions();
+    for (const position of forceSells) {
+      try {
+        await this.executeManualSell(position);
+      } catch (err: any) {
+        console.error(`[AutoSell] Error executing manual sell for ${position.id}:`, err.message);
+      }
+    }
+
+    // 2. Evaluate auto-sell triggers for open positions
     const positions = await getAllOpenPositions();
     if (positions.length === 0) return;
 
     for (const position of positions) {
       if (position.status === 'selling') continue;
+      if (position.force_sell) continue; // Already handled above
 
       try {
         await this.evaluatePosition(position);
@@ -78,6 +97,52 @@ export class AutoSell {
         console.error(`[AutoSell] Error evaluating position ${position.id}:`, err.message);
       }
     }
+  }
+
+  /**
+   * Manual sell: user sets force_sell=true from dashboard, bot sells immediately.
+   */
+  private async executeManualSell(position: SniperPosition): Promise<void> {
+    const config = await getUserConfig(position.user_id);
+    if (!config) {
+      await log(position.user_id, 'error', `No config found for manual sell of ${position.token_symbol}`);
+      return;
+    }
+
+    const mint = new PublicKey(position.token_mint);
+    const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
+
+    const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
+    let currentBalance: number;
+    try {
+      const balanceResp = await this.connection.getTokenAccountBalance(ata);
+      currentBalance = safeNum(balanceResp.value.uiAmount, 0);
+    } catch {
+      await updatePosition(position.id, {
+        status: 'closed',
+        force_sell: false,
+        closed_at: new Date().toISOString(),
+      });
+      return;
+    }
+
+    if (currentBalance <= 0) {
+      await updatePosition(position.id, {
+        status: 'closed',
+        force_sell: false,
+        closed_at: new Date().toISOString(),
+      });
+      return;
+    }
+
+    await log(
+      position.user_id,
+      'info',
+      `Manual sell triggered for ${position.token_symbol} (${currentBalance} tokens)`,
+      { positionId: position.id }
+    );
+
+    await this.executeSell(config, position, currentBalance, 'manual');
   }
 
   private async evaluatePosition(position: SniperPosition): Promise<void> {
@@ -92,7 +157,7 @@ export class AutoSell {
     let currentBalance: number;
     try {
       const balanceResp = await this.connection.getTokenAccountBalance(ata);
-      currentBalance = parseFloat(balanceResp.value.uiAmountString || '0');
+      currentBalance = safeNum(balanceResp.value.uiAmount, 0);
     } catch {
       // Token account might be closed
       await updatePosition(position.id, { status: 'closed', closed_at: new Date().toISOString() });
@@ -104,84 +169,51 @@ export class AutoSell {
       return;
     }
 
-    // Get current token value by checking bonding curve
-    const currentValueSol = await this.estimateTokenValueSol(mint, currentBalance);
+    // Get current token value from bonding curve
+    const currentValueSol = await estimateTokenValueSol(this.connection, mint, currentBalance);
     if (currentValueSol === null) return;
 
-    const pnlPct = ((currentValueSol - position.amount_sol_spent) / position.amount_sol_spent) * 100;
+    const amountSpent = safeNum(position.amount_sol_spent, 0);
+    const pnlPct = amountSpent > 0
+      ? ((currentValueSol - amountSpent) / amountSpent) * 100
+      : 0;
     const currentPrice = currentBalance > 0 ? currentValueSol / currentBalance : 0;
+
+    // Guard against NaN in DB update
+    const safePnl = Number.isFinite(pnlPct) ? pnlPct : 0;
+    const safePrice = Number.isFinite(currentPrice) ? currentPrice : 0;
 
     // Update position with current data
     await updatePosition(position.id, {
-      current_price_sol: currentPrice,
-      pnl_pct: pnlPct,
+      current_price_sol: safePrice,
+      pnl_pct: safePnl,
       amount_tokens: currentBalance,
     });
 
     // Check take profit
-    if (pnlPct >= config.take_profit_pct) {
+    const tp = safeNum(config.take_profit_pct, 100);
+    if (safePnl >= tp) {
       await log(
         position.user_id,
         'info',
-        `Take profit triggered for ${position.token_symbol}: ${pnlPct.toFixed(2)}% >= ${config.take_profit_pct}%`,
-        { positionId: position.id, pnlPct }
+        `Take profit triggered for ${position.token_symbol}: ${safePnl.toFixed(2)}% >= ${tp}%`,
+        { positionId: position.id, pnlPct: safePnl }
       );
       await this.executeSell(config, position, currentBalance, 'take_profit');
       return;
     }
 
     // Check stop loss
-    if (pnlPct <= -config.stop_loss_pct) {
+    const sl = safeNum(config.stop_loss_pct, 50);
+    if (safePnl <= -sl) {
       await log(
         position.user_id,
         'warn',
-        `Stop loss triggered for ${position.token_symbol}: ${pnlPct.toFixed(2)}% <= -${config.stop_loss_pct}%`,
-        { positionId: position.id, pnlPct }
+        `Stop loss triggered for ${position.token_symbol}: ${safePnl.toFixed(2)}% <= -${sl}%`,
+        { positionId: position.id, pnlPct: safePnl }
       );
       await this.executeSell(config, position, currentBalance, 'stop_loss');
       return;
-    }
-  }
-
-  private async estimateTokenValueSol(mint: PublicKey, tokenAmount: number): Promise<number | null> {
-    try {
-      // Derive bonding curve PDA
-      const [bondingCurve] = PublicKey.findProgramAddressSync(
-        [Buffer.from('bonding-curve'), mint.toBuffer()],
-        PUMP_PROGRAM
-      );
-
-      // Get bonding curve account data to read virtual reserves
-      const accountInfo = await this.connection.getAccountInfo(bondingCurve);
-      if (!accountInfo || !accountInfo.data) return null;
-
-      const data = accountInfo.data;
-      // Pump.fun bonding curve layout (after 8 byte discriminator):
-      // virtualTokenReserves: u64 (offset 8)
-      // virtualSolReserves: u64 (offset 16)
-      // realTokenReserves: u64 (offset 24)
-      // realSolReserves: u64 (offset 32)
-      // tokenTotalSupply: u64 (offset 40)
-      // complete: bool (offset 48)
-
-      if (data.length < 49) return null;
-
-      const virtualTokenReserves = Number(data.readBigUInt64LE(8));
-      const virtualSolReserves = Number(data.readBigUInt64LE(16));
-
-      if (virtualTokenReserves === 0) return null;
-
-      // Constant product formula: price = virtualSolReserves / virtualTokenReserves
-      // Value of tokens = tokenAmount * (virtualSolReserves / virtualTokenReserves)
-      // Note: token amounts from bonding curve are in raw units (6 decimals for pump.fun)
-      const rawTokenAmount = tokenAmount * 1e6;
-      const valueLamports = (rawTokenAmount * virtualSolReserves) / virtualTokenReserves;
-      const valueSol = valueLamports / LAMPORTS_PER_SOL;
-
-      return valueSol;
-    } catch (err) {
-      console.error(`[AutoSell] Error estimating value for ${mint.toBase58()}:`, err);
-      return null;
     }
   }
 
@@ -189,21 +221,24 @@ export class AutoSell {
     config: SniperConfig,
     position: SniperPosition,
     tokenAmount: number,
-    reason: 'take_profit' | 'stop_loss'
+    reason: 'take_profit' | 'stop_loss' | 'manual'
   ): Promise<void> {
     // Mark as selling to prevent duplicate sells
-    await updatePosition(position.id, { status: 'selling' });
+    await updatePosition(position.id, { status: 'selling', force_sell: false });
 
     try {
       const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
       const mint = new PublicKey(position.token_mint);
 
+      const slippageBps = safeNum(config.slippage_bps, 500);
+      const priorityFee = safeNum(config.priority_fee_lamports, 100000);
+
       const tx = await this.buildSellTransaction(
         wallet,
         mint,
         tokenAmount,
-        config.slippage_bps,
-        config.priority_fee_lamports
+        slippageBps,
+        priorityFee
       );
 
       const signature = await sendAndConfirmTransaction(this.connection, tx, [wallet], {
@@ -211,7 +246,7 @@ export class AutoSell {
         maxRetries: 3,
       });
 
-      // Get SOL balance change
+      // Get SOL balance change to determine actual sell proceeds
       const txDetails = await this.connection.getParsedTransaction(signature, {
         maxSupportedTransactionVersion: 0,
       });
@@ -228,23 +263,25 @@ export class AutoSell {
         }
       }
 
-      const finalPnl = position.amount_sol_spent > 0
-        ? ((soldAmountSol - position.amount_sol_spent) / position.amount_sol_spent) * 100
+      const amountSpent = safeNum(position.amount_sol_spent, 0);
+      const finalPnl = amountSpent > 0
+        ? ((soldAmountSol - amountSpent) / amountSpent) * 100
         : 0;
+      const safeFinalPnl = Number.isFinite(finalPnl) ? finalPnl : 0;
 
       await updatePosition(position.id, {
         status: 'closed',
         tx_signature_sell: signature,
         sold_amount_sol: soldAmountSol,
-        pnl_pct: finalPnl,
+        pnl_pct: safeFinalPnl,
         closed_at: new Date().toISOString(),
       });
 
       await log(
         config.user_id,
         'success',
-        `Sold ${position.token_symbol} (${reason}): ${soldAmountSol.toFixed(4)} SOL received, PnL: ${finalPnl.toFixed(2)}%`,
-        { positionId: position.id, signature, soldAmountSol, finalPnl, reason }
+        `Sold ${position.token_symbol} (${reason}): ${soldAmountSol.toFixed(4)} SOL received, PnL: ${safeFinalPnl.toFixed(2)}%`,
+        { positionId: position.id, signature, soldAmountSol, finalPnl: safeFinalPnl, reason }
       );
     } catch (err: any) {
       // Revert status to open so we can retry
@@ -282,15 +319,11 @@ export class AutoSell {
     const ata = await getAssociatedTokenAddress(mint, wallet.publicKey);
 
     // Derive bonding curve accounts
-    const [bondingCurve] = PublicKey.findProgramAddressSync(
-      [Buffer.from('bonding-curve'), mint.toBuffer()],
-      PUMP_PROGRAM
-    );
+    const bondingCurve = deriveBondingCurve(mint);
     const associatedBondingCurve = await getAssociatedTokenAddress(mint, bondingCurve, true);
 
     // Encode sell instruction: discriminator + amount (u64) + minSolOutput (u64)
     const rawTokenAmount = BigInt(Math.floor(tokenAmount * 1e6));
-    // Min SOL output with slippage protection (set to 0 for market sell, slippage handled by protocol)
     const minSolOutput = BigInt(0);
 
     const data = Buffer.alloc(24);

@@ -1,6 +1,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { CONFIG } from './config';
 import { SniperConfig, SniperPosition, SniperLog } from './types';
+import { normalizeConfig } from './utils';
 
 let client: SupabaseClient | null = null;
 
@@ -21,7 +22,7 @@ export async function getEnabledConfigs(): Promise<SniperConfig[]> {
     console.error('[Supabase] Error fetching configs:', error.message);
     return [];
   }
-  return data || [];
+  return (data || []).map((row) => normalizeConfig(row));
 }
 
 export async function getUserConfig(userId: string): Promise<SniperConfig | null> {
@@ -32,7 +33,7 @@ export async function getUserConfig(userId: string): Promise<SniperConfig | null
     .single();
 
   if (error) return null;
-  return data;
+  return normalizeConfig(data);
 }
 
 export async function insertPosition(position: Omit<SniperPosition, 'id' | 'created_at' | 'closed_at'>): Promise<SniperPosition | null> {
@@ -85,6 +86,53 @@ export async function getAllOpenPositions(): Promise<SniperPosition[]> {
     return [];
   }
   return data || [];
+}
+
+/**
+ * Get positions flagged for manual sell (force_sell = true).
+ */
+export async function getForceSellPositions(): Promise<SniperPosition[]> {
+  const { data, error } = await getSupabase()
+    .from('sniper_positions')
+    .select('*')
+    .eq('force_sell', true)
+    .eq('status', 'open');
+
+  if (error) {
+    console.error('[Supabase] Error fetching force-sell positions:', error.message);
+    return [];
+  }
+  return data || [];
+}
+
+/**
+ * Track daily spend: increment daily_spent_sol and reset if past midnight.
+ */
+export async function trackDailySpend(userId: string, amountSol: number): Promise<void> {
+  const config = await getUserConfig(userId);
+  if (!config) return;
+
+  const now = new Date();
+  const resetAt = config.budget_reset_at ? new Date(config.budget_reset_at) : new Date(0);
+
+  // Reset daily spend if past the reset time (start of today)
+  const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  if (resetAt < todayStart) {
+    await getSupabase()
+      .from('sniper_config')
+      .update({
+        daily_spent_sol: amountSol,
+        budget_reset_at: todayStart.toISOString(),
+      })
+      .eq('user_id', userId);
+  } else {
+    await getSupabase()
+      .from('sniper_config')
+      .update({
+        daily_spent_sol: config.daily_spent_sol + amountSol,
+      })
+      .eq('user_id', userId);
+  }
 }
 
 export async function insertLog(log: SniperLog): Promise<void> {

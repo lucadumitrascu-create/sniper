@@ -2,6 +2,7 @@ import WebSocket from 'ws';
 import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
 import { CONFIG } from './config';
 import { PumpTokenLaunch } from './types';
+import { sleep } from './utils';
 import { EventEmitter } from 'events';
 
 const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
@@ -192,6 +193,3 @@ export class PumpMonitor extends EventEmitter {
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
