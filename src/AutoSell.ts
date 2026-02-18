@@ -7,7 +7,6 @@ import {
   ComputeBudgetProgram,
   SystemProgram,
   LAMPORTS_PER_SOL,
-  sendAndConfirmTransaction,
 } from '@solana/web3.js';
 import {
   getAssociatedTokenAddress,
@@ -38,7 +37,7 @@ import {
   estimateTokenValueSol,
 } from './utils';
 
-// Pump.fun "sell" instruction discriminator
+// Pump.fun "sell" instruction discriminator (sha256("global:sell") first 8 bytes)
 const SELL_DISCRIMINATOR = Buffer.from([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]);
 
 export class AutoSell {
@@ -233,7 +232,7 @@ export class AutoSell {
       const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
       const mint = new PublicKey(position.token_mint);
 
-      // Read bonding curve to get creator for creatorVault PDA
+      // Read bonding curve to get creator for creatorVault PDA + estimate sell value
       const curve = await readBondingCurve(this.connection, mint);
       if (!curve) {
         throw new Error('Could not read bonding curve to derive creatorVault');
@@ -243,19 +242,56 @@ export class AutoSell {
       const slippageBps = safeNum(config.slippage_bps, 500);
       const priorityFee = safeNum(config.priority_fee_lamports, 100000);
 
+      // Calculate expected SOL output for minSolOutput (slippage protection)
+      const rawTokenAmount = BigInt(Math.floor(tokenAmount * 1e6));
+      let minSolOutput = BigInt(0);
+      if (curve.virtualTokenReserves > 0n) {
+        // expectedSol = (tokenAmount * virtualSolReserves) / (virtualTokenReserves + tokenAmount)
+        const expectedSolLamports = (rawTokenAmount * curve.virtualSolReserves) / (curve.virtualTokenReserves + rawTokenAmount);
+        // Apply slippage downward: accept less SOL
+        minSolOutput = expectedSolLamports * BigInt(10000 - slippageBps) / BigInt(10000);
+      }
+      // For stop loss / manual emergency, accept any output
+      if (reason === 'stop_loss' || reason === 'manual') {
+        minSolOutput = BigInt(0);
+      }
+
+      console.log(`[DEBUG SELL] tokens=${tokenAmount}, rawTokenAmount=${rawTokenAmount}, minSolOutput=${minSolOutput}, reason=${reason}`);
+
       const tx = await this.buildSellTransaction(
         wallet,
         mint,
         creator,
-        tokenAmount,
-        slippageBps,
+        rawTokenAmount,
+        minSolOutput,
         priorityFee
       );
 
-      const signature = await sendAndConfirmTransaction(this.connection, tx, [wallet], {
-        commitment: 'confirmed',
-        maxRetries: 3,
+      // Get fresh blockhash, sign, and send
+      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = wallet.publicKey;
+      tx.sign(wallet);
+
+      const rawTx = tx.serialize();
+      const signature = await this.connection.sendRawTransaction(rawTx, {
+        skipPreflight: true,
+        maxRetries: 5,
       });
+
+      await log(config.user_id, 'info', `Sell tx sent for ${position.token_symbol}: ${signature}, awaiting confirmation...`, {
+        positionId: position.id, signature, reason,
+      });
+
+      // Confirm with proper blockhash-based strategy
+      const confirmation = await this.connection.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight },
+        'confirmed'
+      );
+
+      if (confirmation.value.err) {
+        throw new Error(`Sell tx failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+      }
 
       // Get SOL balance change to determine actual sell proceeds
       const txDetails = await this.connection.getParsedTransaction(signature, {
@@ -307,6 +343,7 @@ export class AutoSell {
 
   /**
    * Build Pump.fun sell transaction with all 14 required accounts.
+   * Returns an UNSIGNED transaction without blockhash.
    *
    * Account layout:
    *   0  global                  (read)
@@ -330,8 +367,8 @@ export class AutoSell {
     wallet: Keypair,
     mint: PublicKey,
     creator: PublicKey,
-    tokenAmount: number,
-    slippageBps: number,
+    rawTokenAmount: bigint,
+    minSolOutput: bigint,
     priorityFeeLamports: number
   ): Promise<Transaction> {
     const tx = new Transaction();
@@ -357,9 +394,6 @@ export class AutoSell {
 
     // Encode sell instruction data (24 bytes):
     // discriminator(8) + amount(u64) + minSolOutput(u64)
-    const rawTokenAmount = BigInt(Math.floor(tokenAmount * 1e6));
-    const minSolOutput = BigInt(0);
-
     const data = Buffer.alloc(24);
     SELL_DISCRIMINATOR.copy(data, 0);
     data.writeBigUInt64LE(rawTokenAmount, 8);
@@ -387,10 +421,6 @@ export class AutoSell {
     });
 
     tx.add(sellIx);
-
-    const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = wallet.publicKey;
 
     return tx;
   }

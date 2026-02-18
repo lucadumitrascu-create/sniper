@@ -80,19 +80,19 @@ class SniperBot {
       return;
     }
 
-    // Execute snipes for all enabled users concurrently (respecting max concurrent)
-    const snipePromises = enabledConfigs.map(async (config) => {
-      try {
-        await this.sniper.executeBuy(config, launch);
-      } catch (err: any) {
-        await log(config.user_id, 'error', `Snipe orchestration error: ${err.message}`);
-      }
-    });
-
-    // Limit concurrency
-    const batches = chunk(snipePromises, CONFIG.MAX_CONCURRENT_SNIPES);
-    for (const batch of batches) {
-      await Promise.allSettled(batch);
+    // Execute snipes for all enabled users with proper concurrency limiting
+    // (promises must be created lazily per batch, not eagerly via .map)
+    for (let i = 0; i < enabledConfigs.length; i += CONFIG.MAX_CONCURRENT_SNIPES) {
+      const batch = enabledConfigs.slice(i, i + CONFIG.MAX_CONCURRENT_SNIPES);
+      await Promise.allSettled(
+        batch.map(async (config) => {
+          try {
+            await this.sniper.executeBuy(config, launch);
+          } catch (err: any) {
+            await log(config.user_id, 'error', `Snipe orchestration error: ${err.message}`);
+          }
+        })
+      );
     }
   }
 
@@ -123,14 +123,6 @@ class SniperBot {
       syslog('error', `Unhandled rejection: ${reason}`, { reason: String(reason) });
     });
   }
-}
-
-function chunk<T>(array: T[], size: number): T[][] {
-  const chunks: T[][] = [];
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
-  }
-  return chunks;
 }
 
 // Start the bot

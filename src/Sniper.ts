@@ -7,7 +7,6 @@ import {
   ComputeBudgetProgram,
   SystemProgram,
   LAMPORTS_PER_SOL,
-  sendAndConfirmTransaction,
 } from '@solana/web3.js';
 import {
   getAssociatedTokenAddress,
@@ -36,7 +35,7 @@ import {
   sleep,
 } from './utils';
 
-// Pump.fun "buy" instruction discriminator
+// Pump.fun "buy" instruction discriminator (sha256("global:buy") first 8 bytes)
 const BUY_DISCRIMINATOR = Buffer.from([0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea]);
 
 export class Sniper {
@@ -91,11 +90,16 @@ export class Sniper {
       }
     }
 
-    // Always read bonding curve: needed for creator (creatorVault PDA) and optional filters
+    // Read bonding curve with retries (new tokens may not be propagated yet)
     const mint = new PublicKey(mintKey);
-    const curve = await readBondingCurve(this.connection, mint);
+    let curve: BondingCurveState | null = null;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      curve = await readBondingCurve(this.connection, mint);
+      if (curve) break;
+      await sleep(400);
+    }
     if (!curve) {
-      await log(userId, 'error', `Could not read bonding curve for ${launch.symbol}, cannot derive accounts`);
+      await log(userId, 'error', `Could not read bonding curve for ${launch.symbol} after 5 retries, skipping`);
       return null;
     }
 
@@ -137,16 +141,30 @@ export class Sniper {
       const slippageBps = safeNum(userConfig.slippage_bps, 500);
       const priorityFee = safeNum(userConfig.priority_fee_lamports, 100000);
 
-      await log(userId, 'info', `Sniping ${launch.symbol} (${mintKey}) with ${buyAmountSol} SOL | slippage=${slippageBps}bps | priorityFee=${priorityFee}`, {
+      // Compute SOL amounts for balance check
+      const buyAmountLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
+      const maxSolCost = buyAmountLamports + Math.floor(buyAmountLamports * slippageBps / 10000);
+
+      // Check wallet has enough SOL (maxSolCost + 0.01 SOL buffer for fees/rent)
+      const walletBalance = await this.connection.getBalance(wallet.publicKey);
+      const neededLamports = maxSolCost + 10_000_000;
+      if (walletBalance < neededLamports) {
+        await log(userId, 'error', `Insufficient SOL: have ${(walletBalance / LAMPORTS_PER_SOL).toFixed(4)}, need ~${(neededLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+        return null;
+      }
+
+      await log(userId, 'info', `Sniping ${launch.symbol} (${mintKey}) with ${buyAmountSol} SOL | slippage=${slippageBps}bps | balance=${(walletBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`, {
         mint: mintKey,
         symbol: launch.symbol,
         buyAmount: buyAmountSol,
         slippageBps,
         priorityFeeLamports: priorityFee,
+        walletBalance: walletBalance / LAMPORTS_PER_SOL,
         virtualTokenReserves: curve.virtualTokenReserves.toString(),
         virtualSolReserves: curve.virtualSolReserves.toString(),
       });
 
+      // Build instruction (without blockhash — we set it below for fresh signing)
       const tx = await this.buildBuyTransaction(
         wallet,
         mint,
@@ -158,12 +176,34 @@ export class Sniper {
         priorityFee
       );
 
-      const signature = await sendAndConfirmTransaction(this.connection, tx, [wallet], {
-        commitment: 'confirmed',
-        maxRetries: 3,
+      // Get fresh blockhash, sign, and send
+      const { blockhash, lastValidBlockHeight } = await this.connection.getLatestBlockhash('confirmed');
+      tx.recentBlockhash = blockhash;
+      tx.feePayer = wallet.publicKey;
+      tx.sign(wallet);
+
+      const rawTx = tx.serialize();
+      const signature = await this.connection.sendRawTransaction(rawTx, {
+        skipPreflight: true,
+        maxRetries: 5,
       });
 
-      await log(userId, 'success', `Buy executed for ${launch.symbol}: ${signature}`, {
+      await log(userId, 'info', `Buy tx sent: ${signature}, awaiting confirmation...`, {
+        mint: mintKey,
+        signature,
+      });
+
+      // Confirm with proper blockhash-based strategy
+      const confirmation = await this.connection.confirmTransaction(
+        { signature, blockhash, lastValidBlockHeight },
+        'confirmed'
+      );
+
+      if (confirmation.value.err) {
+        throw new Error(`Transaction failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
+      }
+
+      await log(userId, 'success', `Buy confirmed for ${launch.symbol}: ${signature}`, {
         mint: mintKey,
         signature,
       });
@@ -220,8 +260,10 @@ export class Sniper {
 
   /**
    * Build Pump.fun buy transaction with all 16 required accounts.
+   * Returns an UNSIGNED transaction without blockhash — caller must set
+   * recentBlockhash, feePayer, and sign before sending.
    *
-   * Account layout:
+   * Account layout (per current IDL):
    *   0  global                    (read)
    *   1  feeRecipient              (write)
    *   2  mint                      (read)
@@ -234,7 +276,7 @@ export class Sniper {
    *   9  creatorVault              (write)
    *  10  eventAuthority            (read)
    *  11  program                   (read)  - Pump program
-   *  12  globalVolumeAccumulator   (read)
+   *  12  globalVolumeAccumulator   (write)
    *  13  userVolumeAccumulator     (write)
    *  14  feeConfig                 (read)
    *  15  feeProgram                (read)
@@ -300,9 +342,9 @@ export class Sniper {
     }
 
     // Debug: log all computed values before building instruction
-    console.log(`[DEBUG] buy_amount_sol=${buyAmountSol}, lamports=${buyAmountLamports}, maxSolCost=${maxSolCost}`);
-    console.log(`[DEBUG] virtualTokenReserves=${curve.virtualTokenReserves}, virtualSolReserves=${curve.virtualSolReserves}`);
-    console.log(`[DEBUG] expectedTokens=${expectedTokens}, minTokenAmount (after slippage)=${minTokenAmount}`);
+    console.log(`[DEBUG BUY] sol=${buyAmountSol}, lamports=${buyAmountLamports}, maxSolCost=${maxSolCost}`);
+    console.log(`[DEBUG BUY] reserves: token=${curve.virtualTokenReserves}, sol=${curve.virtualSolReserves}`);
+    console.log(`[DEBUG BUY] expectedTokens=${expectedTokens}, minTokenAmount=${minTokenAmount}`);
 
     // Encode buy instruction data (25 bytes):
     // discriminator(8) + amount(u64) + maxSolCost(u64) + trackVolume(u8)
@@ -339,7 +381,7 @@ export class Sniper {
         { pubkey: creatorVault, isSigner: false, isWritable: true },                       // 9  creatorVault
         { pubkey: PUMP_EVENT_AUTHORITY, isSigner: false, isWritable: false },              // 10 eventAuthority
         { pubkey: PUMP_PROGRAM, isSigner: false, isWritable: false },                      // 11 program
-        { pubkey: PUMP_GLOBAL_VOLUME_ACCUMULATOR, isSigner: false, isWritable: false },    // 12 globalVolumeAccumulator
+        { pubkey: PUMP_GLOBAL_VOLUME_ACCUMULATOR, isSigner: false, isWritable: true },     // 12 globalVolumeAccumulator (WRITABLE)
         { pubkey: userVolumeAccumulator, isSigner: false, isWritable: true },              // 13 userVolumeAccumulator
         { pubkey: PUMP_FEE_CONFIG, isSigner: false, isWritable: false },                   // 14 feeConfig
         { pubkey: PUMP_FEE_PROGRAM, isSigner: false, isWritable: false },                  // 15 feeProgram
@@ -348,10 +390,6 @@ export class Sniper {
     });
 
     tx.add(buyIx);
-
-    const { blockhash } = await this.connection.getLatestBlockhash('confirmed');
-    tx.recentBlockhash = blockhash;
-    tx.feePayer = wallet.publicKey;
 
     return tx;
   }

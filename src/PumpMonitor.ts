@@ -1,4 +1,3 @@
-import WebSocket from 'ws';
 import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
 import { CONFIG } from './config';
 import { PumpTokenLaunch } from './types';
@@ -8,13 +7,12 @@ import { EventEmitter } from 'events';
 
 const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
 
-// Pump.fun "create" instruction discriminator (first 8 bytes of sha256("global:create"))
-const CREATE_DISCRIMINATOR = Buffer.from([0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77]);
-
 export class PumpMonitor extends EventEmitter {
   private connection: Connection;
   private wsSubscriptionId: number | null = null;
   private running = false;
+  private lastEventTime = Date.now();
+  private healthCheckInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     super();
@@ -30,10 +28,25 @@ export class PumpMonitor extends EventEmitter {
     await syslog('info', `PumpMonitor starting. Watching program: ${PUMP_PROGRAM.toBase58()}`);
 
     this.subscribeToLogs();
+
+    // Health check: if no events for 60s, the WebSocket is probably dead — reconnect
+    this.healthCheckInterval = setInterval(() => {
+      const elapsed = Date.now() - this.lastEventTime;
+      if (elapsed > 60_000) {
+        syslog('warn', `PumpMonitor: no events for ${Math.floor(elapsed / 1000)}s, reconnecting WebSocket...`);
+        this.reconnect();
+      }
+    }, 30_000);
   }
 
   stop(): void {
     this.running = false;
+
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+
     if (this.wsSubscriptionId !== null) {
       this.connection.removeOnLogsListener(this.wsSubscriptionId)
         .catch((err) => syslog('error', `PumpMonitor error removing listener: ${err.message}`));
@@ -42,11 +55,31 @@ export class PumpMonitor extends EventEmitter {
     syslog('info', 'PumpMonitor stopped.');
   }
 
+  private reconnect(): void {
+    // Remove old subscription
+    if (this.wsSubscriptionId !== null) {
+      this.connection.removeOnLogsListener(this.wsSubscriptionId).catch(() => {});
+      this.wsSubscriptionId = null;
+    }
+
+    // Create fresh connection to force a new WebSocket
+    this.connection = new Connection(CONFIG.SOLANA_RPC_URL, {
+      wsEndpoint: CONFIG.SOLANA_WS_URL,
+      commitment: 'confirmed',
+    });
+
+    this.lastEventTime = Date.now(); // Reset timer to avoid immediate re-reconnect
+    this.subscribeToLogs();
+  }
+
   private subscribeToLogs(): void {
     try {
       this.wsSubscriptionId = this.connection.onLogs(
         PUMP_PROGRAM,
         async (logInfo) => {
+          // Update last event time on ANY event (even non-create) to track WS health
+          this.lastEventTime = Date.now();
+
           if (logInfo.err) return;
 
           const hasCreate = logInfo.logs.some(
@@ -83,17 +116,17 @@ export class PumpMonitor extends EventEmitter {
   }
 
   private async parseCreateTransaction(signature: string): Promise<PumpTokenLaunch | null> {
-    // Wait briefly for tx to be fully confirmed and available
-    await sleep(2000);
+    // Short delay for tx to propagate (reduced from 2000ms)
+    await sleep(500);
 
     let tx: ParsedTransactionWithMeta | null = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 4; attempt++) {
       tx = await this.connection.getParsedTransaction(signature, {
         maxSupportedTransactionVersion: 0,
         commitment: 'confirmed',
       });
       if (tx) break;
-      await sleep(1000);
+      await sleep(500);
     }
 
     if (!tx || !tx.meta || tx.meta.err) return null;
