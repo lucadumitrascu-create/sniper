@@ -2,7 +2,7 @@ import { CONFIG, validateConfig } from './config';
 import { PumpMonitor } from './PumpMonitor';
 import { Sniper } from './Sniper';
 import { AutoSell } from './AutoSell';
-import { getEnabledConfigs, log } from './supabase';
+import { getEnabledConfigs, log, syslog, checkSupabaseConnection } from './supabase';
 import { PumpTokenLaunch, SniperConfig } from './types';
 
 class SniperBot {
@@ -19,25 +19,31 @@ class SniperBot {
   }
 
   async start(): Promise<void> {
-    console.log('===========================================');
-    console.log('   Pump.fun Sniper Bot - Starting...');
-    console.log('===========================================');
+    await syslog('info', 'Pump.fun Sniper Bot - Starting...');
 
     validateConfig();
+
+    // Verify Supabase connectivity before proceeding
+    const connected = await checkSupabaseConnection();
+    if (!connected) {
+      await syslog('error', 'Supabase connection failed. Bot will continue but logs may not appear in dashboard.');
+    }
 
     // Load initial configs
     await this.refreshConfigs();
 
     // Start config polling
     this.configPollInterval = setInterval(
-      () => this.refreshConfigs().catch(console.error),
+      () => this.refreshConfigs().catch((err) =>
+        syslog('error', `Config refresh error: ${err.message}`)
+      ),
       CONFIG.POLL_INTERVAL_MS
     );
 
     // Set up launch handler
     this.pumpMonitor.on('launch', (launch: PumpTokenLaunch) => {
       this.handleLaunch(launch).catch((err) =>
-        console.error('[Bot] Error handling launch:', err)
+        syslog('error', `Error handling launch: ${err.message}`, { error: err.message })
       );
     });
 
@@ -45,8 +51,7 @@ class SniperBot {
     await this.pumpMonitor.start();
     this.autoSell.start();
 
-    console.log('[Bot] All systems operational.');
-    console.log(`[Bot] Monitoring ${this.configCache.size} active user(s).`);
+    await syslog('success', `All systems operational. Monitoring ${this.configCache.size} active user(s).`);
 
     // Keep process alive
     this.setupGracefulShutdown();
@@ -61,14 +66,17 @@ class SniperBot {
   }
 
   private async handleLaunch(launch: PumpTokenLaunch): Promise<void> {
-    console.log(`[Bot] New token detected: ${launch.symbol} (${launch.mint})`);
+    await syslog('info', `New token detected: ${launch.symbol} (${launch.mint})`, {
+      mint: launch.mint,
+      symbol: launch.symbol,
+    });
 
     // Refresh configs to get latest settings
     await this.refreshConfigs();
 
     const enabledConfigs = Array.from(this.configCache.values());
     if (enabledConfigs.length === 0) {
-      console.log('[Bot] No enabled users, skipping.');
+      await syslog('info', 'No enabled users, skipping.');
       return;
     }
 
@@ -90,7 +98,7 @@ class SniperBot {
 
   private setupGracefulShutdown(): void {
     const shutdown = async (signal: string) => {
-      console.log(`\n[Bot] Received ${signal}. Shutting down gracefully...`);
+      await syslog('warn', `Received ${signal}. Shutting down gracefully...`);
 
       if (this.configPollInterval) {
         clearInterval(this.configPollInterval);
@@ -99,7 +107,7 @@ class SniperBot {
       this.pumpMonitor.stop();
       this.autoSell.stop();
 
-      console.log('[Bot] Shutdown complete.');
+      await syslog('info', 'Shutdown complete.');
       process.exit(0);
     };
 
@@ -108,11 +116,11 @@ class SniperBot {
 
     // Handle uncaught errors
     process.on('uncaughtException', (err) => {
-      console.error('[Bot] Uncaught exception:', err);
+      syslog('error', `Uncaught exception: ${err.message}`, { stack: err.stack });
     });
 
     process.on('unhandledRejection', (reason) => {
-      console.error('[Bot] Unhandled rejection:', reason);
+      syslog('error', `Unhandled rejection: ${reason}`, { reason: String(reason) });
     });
   }
 }
@@ -128,6 +136,6 @@ function chunk<T>(array: T[], size: number): T[][] {
 // Start the bot
 const bot = new SniperBot();
 bot.start().catch((err) => {
-  console.error('[Bot] Fatal error:', err);
-  process.exit(1);
+  console.error('[FATAL] Bot startup failed:', err);
+  syslog('error', `Fatal startup error: ${err.message}`).finally(() => process.exit(1));
 });

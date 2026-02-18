@@ -22,6 +22,7 @@ import {
   updatePosition,
   getUserConfig,
   log,
+  syslog,
 } from './supabase';
 import {
   safeNum,
@@ -54,17 +55,17 @@ export class AutoSell {
   start(): void {
     if (this.running) return;
     this.running = true;
-    console.log('[AutoSell] Starting position monitor...');
+    syslog('info', 'AutoSell starting position monitor...');
 
     this.intervalId = setInterval(() => {
       this.checkPositions().catch((err) =>
-        console.error('[AutoSell] Error checking positions:', err)
+        syslog('error', `AutoSell error checking positions: ${err.message}`, { error: err.message })
       );
     }, CONFIG.POLL_INTERVAL_MS);
 
     // Run immediately on start
     this.checkPositions().catch((err) =>
-      console.error('[AutoSell] Error on initial check:', err)
+      syslog('error', `AutoSell error on initial check: ${err.message}`, { error: err.message })
     );
   }
 
@@ -74,7 +75,7 @@ export class AutoSell {
       clearInterval(this.intervalId);
       this.intervalId = null;
     }
-    console.log('[AutoSell] Stopped.');
+    syslog('info', 'AutoSell stopped.');
   }
 
   private async checkPositions(): Promise<void> {
@@ -84,7 +85,9 @@ export class AutoSell {
       try {
         await this.executeManualSell(position);
       } catch (err: any) {
-        console.error(`[AutoSell] Error executing manual sell for ${position.id}:`, err.message);
+        await log(position.user_id, 'error', `AutoSell manual sell error for ${position.token_symbol}: ${err.message}`, {
+          positionId: position.id, error: err.message,
+        });
       }
     }
 
@@ -99,7 +102,9 @@ export class AutoSell {
       try {
         await this.evaluatePosition(position);
       } catch (err: any) {
-        console.error(`[AutoSell] Error evaluating position ${position.id}:`, err.message);
+        await log(position.user_id, 'error', `AutoSell evaluation error for ${position.token_symbol}: ${err.message}`, {
+          positionId: position.id, error: err.message,
+        });
       }
     }
   }

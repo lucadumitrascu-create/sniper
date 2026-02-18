@@ -3,6 +3,7 @@ import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.j
 import { CONFIG } from './config';
 import { PumpTokenLaunch } from './types';
 import { sleep } from './utils';
+import { syslog } from './supabase';
 import { EventEmitter } from 'events';
 
 const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
@@ -26,8 +27,7 @@ export class PumpMonitor extends EventEmitter {
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
-    console.log('[PumpMonitor] Starting Pump.fun launch monitor...');
-    console.log(`[PumpMonitor] Watching program: ${PUMP_PROGRAM.toBase58()}`);
+    await syslog('info', `PumpMonitor starting. Watching program: ${PUMP_PROGRAM.toBase58()}`);
 
     this.subscribeToLogs();
   }
@@ -36,10 +36,10 @@ export class PumpMonitor extends EventEmitter {
     this.running = false;
     if (this.wsSubscriptionId !== null) {
       this.connection.removeOnLogsListener(this.wsSubscriptionId)
-        .catch((err) => console.error('[PumpMonitor] Error removing listener:', err));
+        .catch((err) => syslog('error', `PumpMonitor error removing listener: ${err.message}`));
       this.wsSubscriptionId = null;
     }
-    console.log('[PumpMonitor] Stopped.');
+    syslog('info', 'PumpMonitor stopped.');
   }
 
   private subscribeToLogs(): void {
@@ -54,22 +54,27 @@ export class PumpMonitor extends EventEmitter {
           );
 
           if (hasCreate) {
-            console.log(`[PumpMonitor] Detected CREATE tx: ${logInfo.signature}`);
+            await syslog('info', `Detected CREATE tx: ${logInfo.signature}`, {
+              signature: logInfo.signature,
+            });
             try {
               const launch = await this.parseCreateTransaction(logInfo.signature);
               if (launch) {
                 this.emit('launch', launch);
               }
-            } catch (err) {
-              console.error(`[PumpMonitor] Error parsing tx ${logInfo.signature}:`, err);
+            } catch (err: any) {
+              await syslog('error', `Error parsing tx ${logInfo.signature}: ${err.message}`, {
+                signature: logInfo.signature,
+                error: err.message,
+              });
             }
           }
         },
         'confirmed'
       );
-      console.log('[PumpMonitor] WebSocket subscription active.');
-    } catch (err) {
-      console.error('[PumpMonitor] Failed to subscribe:', err);
+      syslog('success', 'PumpMonitor WebSocket subscription active.');
+    } catch (err: any) {
+      syslog('error', `PumpMonitor failed to subscribe: ${err.message}`, { error: err.message });
       // Retry after delay
       if (this.running) {
         setTimeout(() => this.subscribeToLogs(), 5000);
@@ -192,4 +197,3 @@ export class PumpMonitor extends EventEmitter {
     return { name, symbol, uri };
   }
 }
-
