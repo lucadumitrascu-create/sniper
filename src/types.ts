@@ -29,16 +29,16 @@ export interface SniperPosition {
   token_mint: string;
   token_name: string;
   token_symbol: string;
-  entry_price_sol: number;
-  amount_tokens: number;
-  amount_sol_spent: number;
-  current_price_sol: number;
-  pnl_pct: number;
+  buy_price: number;
+  tokens_received: number;
+  buy_amount_sol: number;
+  current_price: number;
+  pnl_percent: number;
   status: 'open' | 'sold' | 'failed';
   force_sell: boolean;
-  tx_signature_buy: string;
-  tx_signature_sell: string | null;
-  sold_amount_sol: number | null;
+  buy_signature: string;
+  sell_signature: string | null;
+  sell_amount_sol: number | null;
   created_at: string;
   closed_at: string | null;
 }
