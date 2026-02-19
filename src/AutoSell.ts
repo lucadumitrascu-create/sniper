@@ -188,19 +188,19 @@ export class AutoSell {
     const currentValueSol = await estimateTokenValueSol(this.connection, mint, currentBalance);
     if (currentValueSol === null) return null;
 
-    const amountSpent = safeNum(position.amount_sol_spent, 0);
+    const amountSpent = safeNum(position.buy_amount_sol, 0);
     const pnlPct = amountSpent > 0
       ? ((currentValueSol - amountSpent) / amountSpent) * 100
       : 0;
-    const currentPrice = currentBalance > 0 ? currentValueSol / currentBalance : 0;
+    const curPrice = currentBalance > 0 ? currentValueSol / currentBalance : 0;
 
     const safePnl = Number.isFinite(pnlPct) ? pnlPct : 0;
-    const safePrice = Number.isFinite(currentPrice) ? currentPrice : 0;
+    const safePrice = Number.isFinite(curPrice) ? curPrice : 0;
 
     await updatePosition(position.id, {
-      current_price_sol: safePrice,
-      pnl_pct: safePnl,
-      amount_tokens: currentBalance,
+      current_price: safePrice,
+      pnl_percent: safePnl,
+      tokens_received: currentBalance,
     });
 
     return { config, currentBalance, safePnl };
@@ -334,7 +334,7 @@ export class AutoSell {
         }
       }
 
-      const amountSpent = safeNum(position.amount_sol_spent, 0);
+      const amountSpent = safeNum(position.buy_amount_sol, 0);
       const finalPnl = amountSpent > 0
         ? ((soldAmountSol - amountSpent) / amountSpent) * 100
         : 0;
@@ -342,9 +342,9 @@ export class AutoSell {
 
       await updatePosition(position.id, {
         status: 'sold',
-        tx_signature_sell: signature,
-        sold_amount_sol: soldAmountSol,
-        pnl_pct: safeFinalPnl,
+        sell_signature: signature,
+        sell_amount_sol: soldAmountSol,
+        pnl_percent: safeFinalPnl,
         closed_at: new Date().toISOString(),
       });
 
