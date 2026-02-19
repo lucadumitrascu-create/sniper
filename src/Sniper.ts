@@ -236,6 +236,7 @@ export class Sniper {
       await trackDailySpend(userId, buyAmountSol);
 
       // Record position in DB
+      console.log(`[DEBUG] Saving position to DB for ${launch.symbol} (${mintKey}), user=${userId}, tx=${signature}`);
       const position = await insertPosition({
         user_id: userId,
         token_mint: mintKey,
@@ -252,6 +253,12 @@ export class Sniper {
         tx_signature_sell: null,
         sold_amount_sol: null,
       });
+
+      if (position) {
+        console.log(`[DEBUG] Position saved! id=${position.id}, mint=${mintKey}`);
+      } else {
+        console.error(`[CRITICAL] Failed to save position to DB! Buy tx ${signature} succeeded on-chain but position was NOT recorded. mint=${mintKey}, user=${userId}`);
+      }
 
       return position;
     } catch (err: any) {
