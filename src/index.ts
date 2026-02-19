@@ -59,9 +59,15 @@ class SniperBot {
 
   private async refreshConfigs(): Promise<void> {
     const configs = await getEnabledConfigs();
+    const isFirstLoad = this.configCache.size === 0 && configs.length > 0;
     this.configCache.clear();
     for (const config of configs) {
       this.configCache.set(config.user_id, config);
+    }
+    if (isFirstLoad) {
+      for (const config of configs) {
+        console.log(`[CONFIG] Loaded user=${config.user_id.slice(0, 8)}.. enabled=${config.enabled} buy=${config.buy_amount_sol} SOL slippage=${config.slippage_bps}bps auto_sell=${config.auto_sell_enabled} TP=${config.take_profit_pct}% SL=${config.stop_loss_pct}%`);
+      }
     }
   }
 

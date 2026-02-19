@@ -109,12 +109,11 @@ export async function estimateTokenValueSol(
   const curve = await readBondingCurve(connection, mint);
   if (!curve || curve.virtualTokenReserves === 0n) return null;
 
-  const virtualTokenReserves = Number(curve.virtualTokenReserves);
-  const virtualSolReserves = Number(curve.virtualSolReserves);
-
-  const rawTokenAmount = tokenAmount * 1e6;
-  const valueLamports = (rawTokenAmount * virtualSolReserves) / virtualTokenReserves;
-  return valueLamports / LAMPORTS_PER_SOL;
+  // Use constant-product AMM formula (same as actual sell execution):
+  // solOut = (tokenAmount * virtualSolReserves) / (virtualTokenReserves + tokenAmount)
+  const rawTokenAmount = BigInt(Math.floor(tokenAmount * 1e6));
+  const valueLamports = (rawTokenAmount * curve.virtualSolReserves) / (curve.virtualTokenReserves + rawTokenAmount);
+  return Number(valueLamports) / LAMPORTS_PER_SOL;
 }
 
 export function getMarketCapSol(curve: BondingCurveState): number {
