@@ -139,11 +139,20 @@ export function safeNum(value: unknown, fallback: number = 0): number {
 }
 
 export function normalizeConfig(raw: Record<string, unknown>): SniperConfig {
+  // Accept both 'buy_amount_sol' and 'buy_amount' (dashboard compatibility)
+  const rawBuyAmount = raw.buy_amount_sol ?? raw.buy_amount;
+  const buyAmountSol = safeNum(rawBuyAmount, 0.1);
+  if (rawBuyAmount === undefined || rawBuyAmount === null) {
+    console.warn(`[CONFIG] buy_amount_sol missing from DB row (user=${raw.user_id}), using default ${buyAmountSol} SOL`);
+  } else {
+    console.log(`[CONFIG] buy_amount_sol loaded from DB: ${buyAmountSol} SOL (raw=${rawBuyAmount}, type=${typeof rawBuyAmount})`);
+  }
+
   return {
     id: String(raw.id || ''),
     user_id: String(raw.user_id || ''),
     enabled: Boolean(raw.enabled),
-    buy_amount_sol: safeNum(raw.buy_amount_sol, 0.1),
+    buy_amount_sol: buyAmountSol,
     slippage_bps: safeNum(raw.slippage_bps, 500),
     auto_sell_enabled: raw.auto_sell_enabled !== false,
     take_profit_pct: safeNum(raw.take_profit_pct, 100),

@@ -72,6 +72,7 @@ export class Sniper {
 
     // Buy amount sanity check (NaN guard)
     const buyAmountSol = safeNum(userConfig.buy_amount_sol, 0);
+    console.log(`[DEBUG] Config buy_amount_sol: ${userConfig.buy_amount_sol} (type=${typeof userConfig.buy_amount_sol}), resolved: ${buyAmountSol} SOL`);
     if (buyAmountSol <= 0) {
       await log(userId, 'error', `Invalid buy_amount_sol (${userConfig.buy_amount_sol}), skipping ${launch.symbol}`);
       return null;
@@ -143,13 +144,19 @@ export class Sniper {
 
       // Compute SOL amounts for balance check
       const buyAmountLamports = Math.floor(buyAmountSol * LAMPORTS_PER_SOL);
-      const maxSolCost = buyAmountLamports + Math.floor(buyAmountLamports * slippageBps / 10000);
+      const slippageLamports = Math.floor(buyAmountLamports * slippageBps / 10000);
+      const maxSolCost = buyAmountLamports + slippageLamports;
+      const feeBufferLamports = 10_000_000; // 0.01 SOL for tx fees/rent
 
-      // Check wallet has enough SOL (maxSolCost + 0.01 SOL buffer for fees/rent)
+      // Check wallet has enough SOL (maxSolCost + fee buffer)
       const walletBalance = await this.connection.getBalance(wallet.publicKey);
-      const neededLamports = maxSolCost + 10_000_000;
+      const neededLamports = maxSolCost + feeBufferLamports;
+
+      console.log(`[DEBUG] Buy amount breakdown: buy=${buyAmountSol} SOL (${buyAmountLamports} lamports), slippage=${slippageLamports} lamports (${slippageBps}bps), fee_buffer=${feeBufferLamports} lamports`);
+      console.log(`[DEBUG] Total needed: ${(neededLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL (${neededLamports} lamports), wallet balance: ${(walletBalance / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+
       if (walletBalance < neededLamports) {
-        await log(userId, 'error', `Insufficient SOL: have ${(walletBalance / LAMPORTS_PER_SOL).toFixed(4)}, need ~${(neededLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL`);
+        await log(userId, 'error', `Insufficient SOL: have ${(walletBalance / LAMPORTS_PER_SOL).toFixed(4)}, need ~${(neededLamports / LAMPORTS_PER_SOL).toFixed(4)} SOL (buy=${buyAmountSol} + slippage=${(slippageLamports / LAMPORTS_PER_SOL).toFixed(4)} + fees=0.01)`);
         return null;
       }
 
