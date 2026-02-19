@@ -14,13 +14,13 @@ export function getSupabase(): SupabaseClient {
 
 /**
  * Verify Supabase connectivity on startup.
- * Returns true if we can reach the sniper_logs table.
+ * Checks sniper_config table (sniper_logs table was removed).
  */
 export async function checkSupabaseConnection(): Promise<boolean> {
   try {
     const { error } = await getSupabase()
-      .from('sniper_logs')
-      .select('id')
+      .from('sniper_config')
+      .select('user_id')
       .limit(1);
 
     if (error) {
@@ -60,17 +60,36 @@ export async function getUserConfig(userId: string): Promise<SniperConfig | null
 }
 
 export async function insertPosition(position: Omit<SniperPosition, 'id' | 'created_at' | 'closed_at'>): Promise<SniperPosition | null> {
-  const { data, error } = await getSupabase()
-    .from('sniper_positions')
-    .insert(position)
-    .select()
-    .single();
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[Supabase] insertPosition attempt ${attempt}/${maxRetries} for mint ${position.token_mint}`);
+      const { data, error } = await getSupabase()
+        .from('sniper_positions')
+        .insert(position)
+        .select()
+        .single();
 
-  if (error) {
-    console.error('[Supabase] Error inserting position:', error.message);
-    return null;
+      if (error) {
+        console.error(`[Supabase] insertPosition attempt ${attempt} failed:`, error.message, error.details, error.hint);
+        if (attempt < maxRetries) {
+          await new Promise((r) => setTimeout(r, 1000 * attempt));
+          continue;
+        }
+        return null;
+      }
+      console.log(`[Supabase] Position inserted successfully: id=${data.id}, mint=${position.token_mint}`);
+      return data;
+    } catch (err: any) {
+      console.error(`[Supabase] insertPosition attempt ${attempt} exception:`, err.message);
+      if (attempt < maxRetries) {
+        await new Promise((r) => setTimeout(r, 1000 * attempt));
+        continue;
+      }
+      return null;
+    }
   }
-  return data;
+  return null;
 }
 
 export async function updatePosition(id: string, updates: Partial<SniperPosition>): Promise<void> {
@@ -159,20 +178,10 @@ export async function trackDailySpend(userId: string, amountSol: number): Promis
 }
 
 /**
- * Insert a log row into Supabase. Bulletproof: never throws.
+ * Insert a log row into Supabase. Disabled — sniper_logs table removed.
  */
 export async function insertLog(entry: SniperLog): Promise<void> {
-  try {
-    const { error } = await getSupabase()
-      .from('sniper_logs')
-      .insert(entry);
-
-    if (error) {
-      console.error('[Supabase] insertLog failed:', error.message);
-    }
-  } catch (err: any) {
-    console.error('[Supabase] insertLog exception:', err.message);
-  }
+  return; // Disabled - logs table removed
 }
 
 /**
@@ -185,33 +194,10 @@ export async function log(userId: string, level: SniperLog['level'], message: st
 }
 
 /**
- * System-level log: writes to console AND inserts a row for EVERY enabled user
- * so the dashboard shows system events (startup, shutdown, errors) for all users.
- * If no users are enabled, it only goes to console.
+ * System-level log: writes to console only. Supabase logging disabled — sniper_logs table removed.
  */
 export async function syslog(level: SniperLog['level'], message: string, metadata?: Record<string, unknown>): Promise<void> {
   const prefix = `[${level.toUpperCase()}] [SYSTEM]`;
   console.log(`${prefix} ${message}`);
-
-  try {
-    const configs = await getEnabledConfigs();
-    if (configs.length === 0) return;
-
-    const rows = configs.map((c) => ({
-      user_id: c.user_id,
-      level,
-      message: `[SYSTEM] ${message}`,
-      metadata,
-    }));
-
-    const { error } = await getSupabase()
-      .from('sniper_logs')
-      .insert(rows);
-
-    if (error) {
-      console.error('[Supabase] syslog insert failed:', error.message);
-    }
-  } catch (err: any) {
-    console.error('[Supabase] syslog exception:', err.message);
-  }
+  return; // Disabled - logs table removed
 }
