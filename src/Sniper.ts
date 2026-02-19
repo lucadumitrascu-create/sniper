@@ -236,9 +236,10 @@ export class Sniper {
       await trackDailySpend(userId, buyAmountSol);
 
       // Record position in DB
-      console.log(`[DEBUG] Saving position to DB for ${launch.symbol} (${mintKey}), user=${userId}, tx=${signature}`);
+      console.log(`[DEBUG] Saving position to DB for ${launch.symbol} (${mintKey}), user=${userId}, wallet=${wallet.publicKey.toBase58()}, tx=${signature}, tokens=${tokenBalance}, entryPrice=${entryPrice}`);
       const position = await insertPosition({
         user_id: userId,
+        wallet_address: wallet.publicKey.toBase58(),
         token_mint: mintKey,
         token_name: launch.name,
         token_symbol: launch.symbol,

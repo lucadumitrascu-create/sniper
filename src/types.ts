@@ -25,6 +25,7 @@ export interface SniperConfig {
 export interface SniperPosition {
   id: string;
   user_id: string;
+  wallet_address: string;
   token_mint: string;
   token_name: string;
   token_symbol: string;
