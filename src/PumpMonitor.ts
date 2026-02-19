@@ -164,22 +164,40 @@ export class PumpMonitor extends EventEmitter {
     const associatedBondingCurve = accounts[3].toBase58();
     const creator = accounts[7].toBase58();
 
-    // Extract metadata: instruction data > logs > Metaplex on-chain account
+    // Extract metadata with fallback chain + diagnostic logging
+    console.log(`[METADATA] Attempting extraction for ${mint}`);
+
+    // Method 1: Parse from instruction data (Borsh: discriminator + name + symbol + uri)
     let { name, symbol, uri } = this.extractMetadataFromInstructionData(pumpIx);
+    console.log(`[METADATA] Method 1 (instruction data): ${name && symbol ? 'SUCCESS' : 'FAIL'} name="${name}" symbol="${symbol}"`);
+
+    // Method 2: Regex on program log messages
     if (!name && !symbol) {
       ({ name, symbol, uri } = this.extractMetadataFromLogs(tx.meta.logMessages || []));
-    }
-    if (!name && !symbol) {
-      ({ name, symbol, uri } = await this.fetchMetaplexMetadata(mint));
+      console.log(`[METADATA] Method 2 (logs): ${name && symbol ? 'SUCCESS' : 'FAIL'} name="${name}" symbol="${symbol}"`);
     }
 
-    console.log(`[PumpMonitor] Token metadata for ${mint}: name="${name || 'Unknown'}", symbol="${symbol || 'UNKNOWN'}"`);
+    // Method 3: Read Metaplex Token Metadata account (with retries for propagation delay)
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = await this.fetchMetaplexMetadata(mint));
+      console.log(`[METADATA] Method 3 (Metaplex account): ${name && symbol ? 'SUCCESS' : 'FAIL'} name="${name}" symbol="${symbol}"`);
+    }
+
+    // Method 4: Read Token-2022 metadata extension from mint account
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = await this.fetchToken2022Metadata(mint));
+      console.log(`[METADATA] Method 4 (Token-2022 extension): ${name && symbol ? 'SUCCESS' : 'FAIL'} name="${name}" symbol="${symbol}"`);
+    }
+
+    const finalName = name || 'Unknown';
+    const finalSymbol = symbol || 'UNKNOWN';
+    console.log(`[METADATA] RESULT: symbol="${finalSymbol}", name="${finalName}"`);
 
     return {
       signature,
       mint,
-      name: name || 'Unknown',
-      symbol: symbol || 'UNKNOWN',
+      name: finalName,
+      symbol: finalSymbol,
       uri: uri || '',
       bondingCurve,
       associatedBondingCurve,
@@ -194,37 +212,77 @@ export class PumpMonitor extends EventEmitter {
   ): Promise<PumpTokenLaunch | null> {
     if (!tx.meta?.innerInstructions) return null;
 
+    let mint: string | null = null;
+
     // Look for the mint creation in inner instructions
     for (const inner of tx.meta.innerInstructions) {
       for (const ix of inner.instructions) {
         if ('parsed' in ix && ix.parsed?.type === 'initializeMint') {
-          const mint = ix.parsed.info?.mint;
-          if (mint) {
-            let { name, symbol, uri } = this.extractMetadataFromLogs(
-              tx.meta?.logMessages || []
-            );
-            if (!name && !symbol) {
-              ({ name, symbol, uri } = await this.fetchMetaplexMetadata(mint));
-            }
-
-            console.log(`[PumpMonitor] Token metadata (inner) for ${mint}: name="${name || 'Unknown'}", symbol="${symbol || 'UNKNOWN'}"`);
-
-            return {
-              signature,
-              mint,
-              name: name || 'Unknown',
-              symbol: symbol || 'UNKNOWN',
-              uri: uri || '',
-              bondingCurve: '',
-              associatedBondingCurve: '',
-              creator: tx.transaction.message.accountKeys[0]?.pubkey?.toBase58() || '',
-              timestamp: tx.blockTime || Date.now() / 1000,
-            };
-          }
+          mint = ix.parsed.info?.mint || null;
+          if (mint) break;
         }
       }
+      if (mint) break;
     }
-    return null;
+
+    // Also try to find pump.fun instruction data in inner instructions
+    let pumpIxData: any = null;
+    for (const inner of tx.meta.innerInstructions) {
+      for (const ix of inner.instructions) {
+        if ('programId' in ix && (ix as any).programId?.equals?.(PUMP_PROGRAM) && 'data' in ix) {
+          pumpIxData = ix;
+          break;
+        }
+      }
+      if (pumpIxData) break;
+    }
+
+    if (!mint) return null;
+
+    console.log(`[METADATA] (inner) Attempting extraction for ${mint}`);
+
+    // Method 1: Parse pump.fun instruction data from inner instructions
+    let name = '';
+    let symbol = '';
+    let uri = '';
+    if (pumpIxData) {
+      ({ name, symbol, uri } = this.extractMetadataFromInstructionData(pumpIxData));
+      console.log(`[METADATA] (inner) Method 1 (instruction data): ${name && symbol ? 'SUCCESS' : 'FAIL'}`);
+    }
+
+    // Method 2: Regex on log messages
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = this.extractMetadataFromLogs(tx.meta?.logMessages || []));
+      console.log(`[METADATA] (inner) Method 2 (logs): ${name && symbol ? 'SUCCESS' : 'FAIL'}`);
+    }
+
+    // Method 3: Metaplex metadata account
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = await this.fetchMetaplexMetadata(mint));
+      console.log(`[METADATA] (inner) Method 3 (Metaplex): ${name && symbol ? 'SUCCESS' : 'FAIL'}`);
+    }
+
+    // Method 4: Token-2022 metadata extension
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = await this.fetchToken2022Metadata(mint));
+      console.log(`[METADATA] (inner) Method 4 (Token-2022): ${name && symbol ? 'SUCCESS' : 'FAIL'}`);
+    }
+
+    const finalName = name || 'Unknown';
+    const finalSymbol = symbol || 'UNKNOWN';
+    console.log(`[METADATA] (inner) RESULT: symbol="${finalSymbol}", name="${finalName}"`);
+
+    return {
+      signature,
+      mint,
+      name: finalName,
+      symbol: finalSymbol,
+      uri: uri || '',
+      bondingCurve: '',
+      associatedBondingCurve: '',
+      creator: tx.transaction.message.accountKeys[0]?.pubkey?.toBase58() || '',
+      timestamp: tx.blockTime || Date.now() / 1000,
+    };
   }
 
   /**
@@ -285,7 +343,7 @@ export class PumpMonitor extends EventEmitter {
 
   /**
    * Fetch name/symbol/uri from the Metaplex Token Metadata account on-chain.
-   * Fallback when instruction data and log parsing both fail.
+   * Retries up to 3 times with 500ms delay (account may not be propagated yet).
    */
   private async fetchMetaplexMetadata(mintAddress: string): Promise<{ name: string; symbol: string; uri: string }> {
     let name = '';
@@ -303,7 +361,13 @@ export class PumpMonitor extends EventEmitter {
         METADATA_PROGRAM_ID
       );
 
-      const accountInfo = await this.connection.getAccountInfo(metadataPDA);
+      // Retry: metadata account may not be propagated immediately after create tx
+      let accountInfo = null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        accountInfo = await this.connection.getAccountInfo(metadataPDA);
+        if (accountInfo?.data) break;
+        await sleep(500);
+      }
       if (!accountInfo?.data) return { name, symbol, uri };
 
       const data = accountInfo.data;
@@ -340,12 +404,87 @@ export class PumpMonitor extends EventEmitter {
           uri = data.subarray(offset, offset + uriLen).toString('utf8').replace(/\0/g, '').trim();
         }
       }
+    } catch (err: any) {
+      console.log(`[METADATA] Metaplex fetch error: ${err.message}`);
+    }
 
-      if (name || symbol) {
-        console.log(`[PumpMonitor] Extracted metadata from Metaplex account: name="${name}", symbol="${symbol}"`);
+    return { name, symbol, uri };
+  }
+
+  /**
+   * Fetch name/symbol/uri from Token-2022 metadata extension on the mint account.
+   * Pump.fun tokens use Token-2022, which can store metadata inline via TLV extensions.
+   *
+   * Mint account layout:
+   *   [165 bytes] base mint data + padding
+   *   [1 byte]    account type (2 = Mint)
+   *   [N bytes]   TLV extensions: [u16 type][u16 length][data...]
+   *
+   * TokenMetadata extension (type 19) data layout:
+   *   [32 bytes] update_authority (all zeros = None)
+   *   [32 bytes] mint pubkey
+   *   name, symbol, uri as Borsh strings (u32 len + utf8)
+   */
+  private async fetchToken2022Metadata(mintAddress: string): Promise<{ name: string; symbol: string; uri: string }> {
+    let name = '';
+    let symbol = '';
+    let uri = '';
+
+    try {
+      const mint = new PublicKey(mintAddress);
+      const accountInfo = await this.connection.getAccountInfo(mint);
+      if (!accountInfo?.data || accountInfo.data.length <= 166) return { name, symbol, uri };
+
+      const data = accountInfo.data;
+      const TOKEN_METADATA_EXTENSION_TYPE = 19;
+
+      // Scan TLV extensions starting at offset 166
+      let offset = 166;
+      while (offset + 4 <= data.length) {
+        const extType = data.readUInt16LE(offset);
+        const extLen = data.readUInt16LE(offset + 2);
+        offset += 4;
+
+        if (extType === TOKEN_METADATA_EXTENSION_TYPE && extLen > 0 && offset + extLen <= data.length) {
+          // Skip update_authority (32 bytes) + mint (32 bytes) = 64 bytes
+          let metaOffset = offset + 64;
+
+          // Read name
+          if (metaOffset + 4 <= offset + extLen) {
+            const nameLen = data.readUInt32LE(metaOffset);
+            metaOffset += 4;
+            if (nameLen > 0 && nameLen < 200 && metaOffset + nameLen <= offset + extLen) {
+              name = data.subarray(metaOffset, metaOffset + nameLen).toString('utf8').replace(/\0/g, '').trim();
+              metaOffset += nameLen;
+            }
+          }
+
+          // Read symbol
+          if (metaOffset + 4 <= offset + extLen) {
+            const symbolLen = data.readUInt32LE(metaOffset);
+            metaOffset += 4;
+            if (symbolLen > 0 && symbolLen < 50 && metaOffset + symbolLen <= offset + extLen) {
+              symbol = data.subarray(metaOffset, metaOffset + symbolLen).toString('utf8').replace(/\0/g, '').trim();
+              metaOffset += symbolLen;
+            }
+          }
+
+          // Read uri
+          if (metaOffset + 4 <= offset + extLen) {
+            const uriLen = data.readUInt32LE(metaOffset);
+            metaOffset += 4;
+            if (uriLen > 0 && uriLen < 500 && metaOffset + uriLen <= offset + extLen) {
+              uri = data.subarray(metaOffset, metaOffset + uriLen).toString('utf8').replace(/\0/g, '').trim();
+            }
+          }
+
+          break; // Found and parsed metadata extension
+        }
+
+        offset += extLen;
       }
     } catch (err: any) {
-      console.log(`[PumpMonitor] Could not fetch Metaplex metadata: ${err.message}`);
+      console.log(`[METADATA] Token-2022 extension fetch error: ${err.message}`);
     }
 
     return { name, symbol, uri };
