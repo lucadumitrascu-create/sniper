@@ -121,7 +121,7 @@ export async function getAllOpenPositions(): Promise<SniperPosition[]> {
   const { data, error } = await getSupabase()
     .from('sniper_positions')
     .select('*')
-    .in('status', ['open', 'selling']);
+    .eq('status', 'open');
 
   if (error) {
     console.error('[Supabase] Error fetching all positions:', error.message);

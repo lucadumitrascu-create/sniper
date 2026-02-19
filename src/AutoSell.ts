@@ -44,6 +44,7 @@ export class AutoSell {
   private connection: Connection;
   private running = false;
   private intervalId: ReturnType<typeof setInterval> | null = null;
+  private sellingPositions = new Set<string>(); // In-memory guard to prevent duplicate sells
 
   constructor() {
     this.connection = new Connection(CONFIG.SOLANA_RPC_URL, {
@@ -95,7 +96,7 @@ export class AutoSell {
     if (positions.length === 0) return;
 
     for (const position of positions) {
-      if (position.status === 'selling') continue;
+      if (this.sellingPositions.has(position.id)) continue; // Currently being sold
       if (position.force_sell) continue; // Already handled above
 
       try {
@@ -125,7 +126,7 @@ export class AutoSell {
       currentBalance = safeNum(balanceResp.value.uiAmount, 0);
     } catch {
       await updatePosition(position.id, {
-        status: 'closed',
+        status: 'sold',
         force_sell: false,
         closed_at: new Date().toISOString(),
       });
@@ -134,7 +135,7 @@ export class AutoSell {
 
     if (currentBalance <= 0) {
       await updatePosition(position.id, {
-        status: 'closed',
+        status: 'sold',
         force_sell: false,
         closed_at: new Date().toISOString(),
       });
@@ -174,12 +175,12 @@ export class AutoSell {
       const balanceResp = await this.connection.getTokenAccountBalance(ata);
       currentBalance = safeNum(balanceResp.value.uiAmount, 0);
     } catch {
-      await updatePosition(position.id, { status: 'closed', closed_at: new Date().toISOString() });
+      await updatePosition(position.id, { status: 'sold', closed_at: new Date().toISOString() });
       return null;
     }
 
     if (currentBalance <= 0) {
-      await updatePosition(position.id, { status: 'closed', closed_at: new Date().toISOString() });
+      await updatePosition(position.id, { status: 'sold', closed_at: new Date().toISOString() });
       return null;
     }
 
@@ -248,7 +249,8 @@ export class AutoSell {
     tokenAmount: number,
     reason: 'take_profit' | 'stop_loss' | 'manual'
   ): Promise<void> {
-    await updatePosition(position.id, { status: 'selling', force_sell: false });
+    this.sellingPositions.add(position.id);
+    await updatePosition(position.id, { force_sell: false });
 
     try {
       const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
@@ -339,7 +341,7 @@ export class AutoSell {
       const safeFinalPnl = Number.isFinite(finalPnl) ? finalPnl : 0;
 
       await updatePosition(position.id, {
-        status: 'closed',
+        status: 'sold',
         tx_signature_sell: signature,
         sold_amount_sol: soldAmountSol,
         pnl_pct: safeFinalPnl,
@@ -360,6 +362,8 @@ export class AutoSell {
         `Sell failed for ${position.token_symbol}: ${err.message}`,
         { positionId: position.id, error: err.message, reason }
       );
+    } finally {
+      this.sellingPositions.delete(position.id);
     }
   }
 
