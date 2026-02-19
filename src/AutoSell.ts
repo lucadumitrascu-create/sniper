@@ -402,10 +402,15 @@ export class AutoSell {
         throw new Error(`Sell tx failed on-chain: ${JSON.stringify(confirmation.value.err)}`);
       }
 
-      // Get SOL balance change to determine actual sell proceeds
-      const txDetails = await this.connection.getParsedTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-      });
+      // Get SOL balance change to determine actual sell proceeds (retry for indexing lag)
+      let txDetails = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        txDetails = await this.connection.getParsedTransaction(signature, {
+          maxSupportedTransactionVersion: 0,
+        });
+        if (txDetails?.meta) break;
+        await new Promise((r) => setTimeout(r, 1500));
+      }
 
       let soldAmountSol = 0;
       if (txDetails?.meta) {
@@ -419,17 +424,30 @@ export class AutoSell {
         }
       }
 
+      // If we couldn't determine actual proceeds, fall back to bonding curve estimate
+      // (calculated before the sell tx was sent). This prevents writing -100% PnL.
+      if (soldAmountSol <= 0 && curve.virtualTokenReserves > 0n) {
+        const estimatedLamports = (rawTokenAmount * curve.virtualSolReserves) / (curve.virtualTokenReserves + rawTokenAmount);
+        soldAmountSol = Number(estimatedLamports) / LAMPORTS_PER_SOL;
+        console.log(`[AutoSell] getParsedTransaction returned no data for ${signature}, using bonding curve estimate: ${soldAmountSol.toFixed(4)} SOL`);
+      }
+
       const amountSpent = safeNum(position.buy_amount_sol, 0);
       const finalPnl = amountSpent > 0
         ? ((soldAmountSol - amountSpent) / amountSpent) * 100
         : 0;
       const safeFinalPnl = Number.isFinite(finalPnl) ? finalPnl : 0;
 
+      // Freeze final price + PnL at sell time so sold positions retain accurate data
+      const finalPrice = tokenAmount > 0 ? soldAmountSol / tokenAmount : 0;
+      const safeFinalPrice = Number.isFinite(finalPrice) ? finalPrice : 0;
+
       await updatePosition(position.id, {
         status: 'sold',
         sell_signature: signature,
         sell_amount_sol: soldAmountSol,
         pnl_percent: safeFinalPnl,
+        current_price: safeFinalPrice,
         closed_at: new Date().toISOString(),
       });
 
