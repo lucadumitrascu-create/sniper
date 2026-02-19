@@ -43,7 +43,8 @@ const SELL_DISCRIMINATOR = Buffer.from([0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83
 export class AutoSell {
   private connection: Connection;
   private running = false;
-  private intervalId: ReturnType<typeof setInterval> | null = null;
+  private sellCheckInterval: ReturnType<typeof setInterval> | null = null;
+  private priceMonitorInterval: ReturnType<typeof setInterval> | null = null;
   private sellingPositions = new Set<string>(); // In-memory guard to prevent duplicate sells
 
   constructor() {
@@ -55,27 +56,111 @@ export class AutoSell {
   start(): void {
     if (this.running) return;
     this.running = true;
-    syslog('info', 'AutoSell starting position monitor...');
+    syslog('info', 'AutoSell + PriceMonitor starting...');
 
-    this.intervalId = setInterval(() => {
+    // Sell-check loop (every POLL_INTERVAL_MS, default 5s)
+    this.sellCheckInterval = setInterval(() => {
       this.checkPositions().catch((err) =>
         syslog('error', `AutoSell error checking positions: ${err.message}`, { error: err.message })
       );
     }, CONFIG.POLL_INTERVAL_MS);
 
-    // Run immediately on start
+    // Price monitoring loop (every 30s, independent from sell checks)
+    this.priceMonitorInterval = setInterval(() => {
+      this.updateAllPrices().catch((err) =>
+        syslog('error', `PriceMonitor error: ${err.message}`, { error: err.message })
+      );
+    }, 30_000);
+
+    // Run both immediately on start
     this.checkPositions().catch((err) =>
       syslog('error', `AutoSell error on initial check: ${err.message}`, { error: err.message })
+    );
+    this.updateAllPrices().catch((err) =>
+      syslog('error', `PriceMonitor error on initial run: ${err.message}`, { error: err.message })
     );
   }
 
   stop(): void {
     this.running = false;
-    if (this.intervalId) {
-      clearInterval(this.intervalId);
-      this.intervalId = null;
+    if (this.sellCheckInterval) {
+      clearInterval(this.sellCheckInterval);
+      this.sellCheckInterval = null;
     }
-    syslog('info', 'AutoSell stopped.');
+    if (this.priceMonitorInterval) {
+      clearInterval(this.priceMonitorInterval);
+      this.priceMonitorInterval = null;
+    }
+    syslog('info', 'AutoSell + PriceMonitor stopped.');
+  }
+
+  /**
+   * Independent price monitoring loop. Updates current_price, pnl_percent,
+   * and tokens_received for ALL open positions every 30 seconds.
+   * Uses position.wallet_address directly — no config/private key needed.
+   */
+  private async updateAllPrices(): Promise<void> {
+    const positions = await getAllOpenPositions();
+    if (positions.length === 0) return;
+
+    let updated = 0;
+    let failed = 0;
+
+    for (const position of positions) {
+      try {
+        const mint = new PublicKey(position.token_mint);
+        const walletPubkey = new PublicKey(position.wallet_address);
+
+        // Get current token balance from ATA
+        const ata = await getAssociatedTokenAddress(mint, walletPubkey, false, TOKEN_2022_PROGRAM_ID);
+        let currentBalance: number;
+        try {
+          const balanceResp = await this.connection.getTokenAccountBalance(ata);
+          currentBalance = safeNum(balanceResp.value.uiAmount, 0);
+        } catch {
+          // ATA doesn't exist or was closed — tokens are gone
+          await updatePosition(position.id, { status: 'sold', closed_at: new Date().toISOString() });
+          console.log(`[PriceMonitor] ${position.token_symbol}: ATA not found, marking sold`);
+          continue;
+        }
+
+        if (currentBalance <= 0) {
+          await updatePosition(position.id, { status: 'sold', closed_at: new Date().toISOString() });
+          console.log(`[PriceMonitor] ${position.token_symbol}: balance=0, marking sold`);
+          continue;
+        }
+
+        // Read bonding curve and estimate value
+        const currentValueSol = await estimateTokenValueSol(this.connection, mint, currentBalance);
+        if (currentValueSol === null) {
+          console.log(`[PriceMonitor] ${position.token_symbol}: bonding curve unreadable, skipping`);
+          failed++;
+          continue;
+        }
+
+        const amountSpent = safeNum(position.buy_amount_sol, 0);
+        const pnlPct = amountSpent > 0
+          ? ((currentValueSol - amountSpent) / amountSpent) * 100
+          : 0;
+        const curPrice = currentBalance > 0 ? currentValueSol / currentBalance : 0;
+
+        const safePnl = Number.isFinite(pnlPct) ? pnlPct : 0;
+        const safePrice = Number.isFinite(curPrice) ? curPrice : 0;
+
+        await updatePosition(position.id, {
+          current_price: safePrice,
+          pnl_percent: safePnl,
+          tokens_received: currentBalance,
+        });
+
+        updated++;
+      } catch (err: any) {
+        console.error(`[PriceMonitor] Error updating ${position.token_symbol}: ${err.message}`);
+        failed++;
+      }
+    }
+
+    console.log(`[PriceMonitor] Cycle complete: ${updated} updated, ${failed} failed, ${positions.length} total`);
   }
 
   private async checkPositions(): Promise<void> {
