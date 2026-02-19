@@ -109,28 +109,40 @@ export class Sniper {
       return null;
     }
 
-    // Market cap + liquidity filters
-    const hasFilters = userConfig.min_market_cap_sol > 0
-      || userConfig.max_market_cap_sol > 0
-      || userConfig.min_liquidity_sol > 0;
+    // --- Token filters (all thresholds in SOL) ---
+    const mcap = getMarketCapSol(curve);
+    const liquidity = getLiquiditySol(curve);
 
-    if (hasFilters) {
-      const mcap = getMarketCapSol(curve);
-      const liquidity = getLiquiditySol(curve);
+    console.log(`[FILTER] ${launch.symbol} (${mintKey}) mcap=${mcap.toFixed(2)} SOL, liquidity=${liquidity.toFixed(4)} SOL`);
 
-      if (userConfig.min_market_cap_sol > 0 && mcap < userConfig.min_market_cap_sol) {
-        await log(userId, 'info', `Market cap ${mcap.toFixed(2)} SOL < min ${userConfig.min_market_cap_sol} SOL, skipping ${launch.symbol}`);
+    if (userConfig.min_market_cap_sol > 0) {
+      if (mcap < userConfig.min_market_cap_sol) {
+        console.log(`[FILTER] ✗ SKIP - Market cap ${mcap.toFixed(2)} SOL < min ${userConfig.min_market_cap_sol} SOL`);
+        await log(userId, 'info', `[FILTER] Market cap ${mcap.toFixed(2)} SOL < min ${userConfig.min_market_cap_sol} SOL, skipping ${launch.symbol}`);
         return null;
       }
-      if (userConfig.max_market_cap_sol > 0 && mcap > userConfig.max_market_cap_sol) {
-        await log(userId, 'info', `Market cap ${mcap.toFixed(2)} SOL > max ${userConfig.max_market_cap_sol} SOL, skipping ${launch.symbol}`);
-        return null;
-      }
-      if (userConfig.min_liquidity_sol > 0 && liquidity < userConfig.min_liquidity_sol) {
-        await log(userId, 'info', `Liquidity ${liquidity.toFixed(4)} SOL < min ${userConfig.min_liquidity_sol} SOL, skipping ${launch.symbol}`);
-        return null;
-      }
+      console.log(`[FILTER] ✓ Min market cap: ${mcap.toFixed(2)} >= ${userConfig.min_market_cap_sol} SOL`);
     }
+
+    if (userConfig.max_market_cap_sol > 0) {
+      if (mcap > userConfig.max_market_cap_sol) {
+        console.log(`[FILTER] ✗ SKIP - Market cap ${mcap.toFixed(2)} SOL > max ${userConfig.max_market_cap_sol} SOL`);
+        await log(userId, 'info', `[FILTER] Market cap ${mcap.toFixed(2)} SOL > max ${userConfig.max_market_cap_sol} SOL, skipping ${launch.symbol}`);
+        return null;
+      }
+      console.log(`[FILTER] ✓ Max market cap: ${mcap.toFixed(2)} <= ${userConfig.max_market_cap_sol} SOL`);
+    }
+
+    if (userConfig.min_liquidity_sol > 0) {
+      if (liquidity < userConfig.min_liquidity_sol) {
+        console.log(`[FILTER] ✗ SKIP - Liquidity ${liquidity.toFixed(4)} SOL < min ${userConfig.min_liquidity_sol} SOL`);
+        await log(userId, 'info', `[FILTER] Liquidity ${liquidity.toFixed(4)} SOL < min ${userConfig.min_liquidity_sol} SOL, skipping ${launch.symbol}`);
+        return null;
+      }
+      console.log(`[FILTER] ✓ Min liquidity: ${liquidity.toFixed(4)} >= ${userConfig.min_liquidity_sol} SOL`);
+    }
+
+    console.log(`[FILTER] ✓ ALL FILTERS PASSED for ${launch.symbol}`);
 
     // --- Execute snipe ---
     this.activeSnipes.set(mintKey, true);
