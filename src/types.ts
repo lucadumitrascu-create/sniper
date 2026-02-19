@@ -25,6 +25,7 @@ export interface SniperConfig {
 export interface SniperPosition {
   id: string;
   user_id: string;
+  wallet_address: string;
   token_mint: string;
   token_name: string;
   token_symbol: string;
@@ -33,7 +34,7 @@ export interface SniperPosition {
   amount_sol_spent: number;
   current_price_sol: number;
   pnl_pct: number;
-  status: 'open' | 'closed' | 'selling';
+  status: 'open' | 'sold' | 'failed';
   force_sell: boolean;
   tx_signature_buy: string;
   tx_signature_sell: string | null;

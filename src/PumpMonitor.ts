@@ -1,4 +1,5 @@
 import { Connection, PublicKey, ParsedTransactionWithMeta } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { CONFIG } from './config';
 import { PumpTokenLaunch } from './types';
 import { sleep } from './utils';
@@ -6,6 +7,7 @@ import { syslog } from './supabase';
 import { EventEmitter } from 'events';
 
 const PUMP_PROGRAM = new PublicKey(CONFIG.PUMP_PROGRAM_ID);
+const METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
 
 export class PumpMonitor extends EventEmitter {
   private connection: Connection;
@@ -162,8 +164,16 @@ export class PumpMonitor extends EventEmitter {
     const associatedBondingCurve = accounts[3].toBase58();
     const creator = accounts[7].toBase58();
 
-    // Try to extract token metadata from logs
-    const { name, symbol, uri } = this.extractMetadataFromLogs(tx.meta.logMessages || []);
+    // Extract metadata: instruction data > logs > Metaplex on-chain account
+    let { name, symbol, uri } = this.extractMetadataFromInstructionData(pumpIx);
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = this.extractMetadataFromLogs(tx.meta.logMessages || []));
+    }
+    if (!name && !symbol) {
+      ({ name, symbol, uri } = await this.fetchMetaplexMetadata(mint));
+    }
+
+    console.log(`[PumpMonitor] Token metadata for ${mint}: name="${name || 'Unknown'}", symbol="${symbol || 'UNKNOWN'}"`);
 
     return {
       signature,
@@ -178,10 +188,10 @@ export class PumpMonitor extends EventEmitter {
     };
   }
 
-  private parseFromInnerInstructions(
+  private async parseFromInnerInstructions(
     tx: ParsedTransactionWithMeta,
     signature: string
-  ): PumpTokenLaunch | null {
+  ): Promise<PumpTokenLaunch | null> {
     if (!tx.meta?.innerInstructions) return null;
 
     // Look for the mint creation in inner instructions
@@ -190,9 +200,15 @@ export class PumpMonitor extends EventEmitter {
         if ('parsed' in ix && ix.parsed?.type === 'initializeMint') {
           const mint = ix.parsed.info?.mint;
           if (mint) {
-            const { name, symbol, uri } = this.extractMetadataFromLogs(
+            let { name, symbol, uri } = this.extractMetadataFromLogs(
               tx.meta?.logMessages || []
             );
+            if (!name && !symbol) {
+              ({ name, symbol, uri } = await this.fetchMetaplexMetadata(mint));
+            }
+
+            console.log(`[PumpMonitor] Token metadata (inner) for ${mint}: name="${name || 'Unknown'}", symbol="${symbol || 'UNKNOWN'}"`);
+
             return {
               signature,
               mint,
@@ -209,6 +225,130 @@ export class PumpMonitor extends EventEmitter {
       }
     }
     return null;
+  }
+
+  /**
+   * Parse name/symbol/uri from Pump.fun CREATE instruction data.
+   * Layout after 8-byte discriminator: Borsh strings (u32 length + utf8 bytes).
+   */
+  private extractMetadataFromInstructionData(pumpIx: any): { name: string; symbol: string; uri: string } {
+    let name = '';
+    let symbol = '';
+    let uri = '';
+
+    try {
+      if (!pumpIx?.data) return { name, symbol, uri };
+
+      const data = Buffer.from(bs58.decode(pumpIx.data));
+
+      // Skip 8-byte Anchor discriminator
+      let offset = 8;
+
+      // Read name (Borsh string: u32 length prefix + utf8 bytes)
+      if (offset + 4 <= data.length) {
+        const nameLen = data.readUInt32LE(offset);
+        offset += 4;
+        if (nameLen > 0 && nameLen < 200 && offset + nameLen <= data.length) {
+          name = data.subarray(offset, offset + nameLen).toString('utf8').replace(/\0/g, '').trim();
+          offset += nameLen;
+        }
+      }
+
+      // Read symbol
+      if (offset + 4 <= data.length) {
+        const symbolLen = data.readUInt32LE(offset);
+        offset += 4;
+        if (symbolLen > 0 && symbolLen < 50 && offset + symbolLen <= data.length) {
+          symbol = data.subarray(offset, offset + symbolLen).toString('utf8').replace(/\0/g, '').trim();
+          offset += symbolLen;
+        }
+      }
+
+      // Read uri
+      if (offset + 4 <= data.length) {
+        const uriLen = data.readUInt32LE(offset);
+        offset += 4;
+        if (uriLen > 0 && uriLen < 500 && offset + uriLen <= data.length) {
+          uri = data.subarray(offset, offset + uriLen).toString('utf8').replace(/\0/g, '').trim();
+        }
+      }
+
+      if (name || symbol) {
+        console.log(`[PumpMonitor] Extracted metadata from instruction data: name="${name}", symbol="${symbol}"`);
+      }
+    } catch (err: any) {
+      console.log(`[PumpMonitor] Could not parse instruction data: ${err.message}`);
+    }
+
+    return { name, symbol, uri };
+  }
+
+  /**
+   * Fetch name/symbol/uri from the Metaplex Token Metadata account on-chain.
+   * Fallback when instruction data and log parsing both fail.
+   */
+  private async fetchMetaplexMetadata(mintAddress: string): Promise<{ name: string; symbol: string; uri: string }> {
+    let name = '';
+    let symbol = '';
+    let uri = '';
+
+    try {
+      const mint = new PublicKey(mintAddress);
+      const [metadataPDA] = PublicKey.findProgramAddressSync(
+        [
+          Buffer.from('metadata'),
+          METADATA_PROGRAM_ID.toBuffer(),
+          mint.toBuffer(),
+        ],
+        METADATA_PROGRAM_ID
+      );
+
+      const accountInfo = await this.connection.getAccountInfo(metadataPDA);
+      if (!accountInfo?.data) return { name, symbol, uri };
+
+      const data = accountInfo.data;
+
+      // Metadata account layout:
+      // [1 byte] key, [32 bytes] update_authority, [32 bytes] mint = offset 65
+      let offset = 65;
+
+      // Read name (Borsh string: u32 length + utf8 bytes, null-padded to 32 chars)
+      if (offset + 4 <= data.length) {
+        const nameLen = data.readUInt32LE(offset);
+        offset += 4;
+        if (nameLen > 0 && nameLen <= 200 && offset + nameLen <= data.length) {
+          name = data.subarray(offset, offset + nameLen).toString('utf8').replace(/\0/g, '').trim();
+          offset += nameLen;
+        }
+      }
+
+      // Read symbol (null-padded to 10 chars)
+      if (offset + 4 <= data.length) {
+        const symbolLen = data.readUInt32LE(offset);
+        offset += 4;
+        if (symbolLen > 0 && symbolLen <= 50 && offset + symbolLen <= data.length) {
+          symbol = data.subarray(offset, offset + symbolLen).toString('utf8').replace(/\0/g, '').trim();
+          offset += symbolLen;
+        }
+      }
+
+      // Read uri (null-padded to 200 chars)
+      if (offset + 4 <= data.length) {
+        const uriLen = data.readUInt32LE(offset);
+        offset += 4;
+        if (uriLen > 0 && uriLen <= 500 && offset + uriLen <= data.length) {
+          uri = data.subarray(offset, offset + uriLen).toString('utf8').replace(/\0/g, '').trim();
+        }
+      }
+
+      if (name || symbol) {
+        console.log(`[PumpMonitor] Extracted metadata from Metaplex account: name="${name}", symbol="${symbol}"`);
+      }
+    } catch (err: any) {
+      console.log(`[PumpMonitor] Could not fetch Metaplex metadata: ${err.message}`);
+    }
+
+    return { name, symbol, uri };
   }
 
   private extractMetadataFromLogs(logs: string[]): { name: string; symbol: string; uri: string } {
