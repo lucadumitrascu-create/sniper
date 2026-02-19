@@ -93,13 +93,19 @@ export async function insertPosition(position: Omit<SniperPosition, 'id' | 'crea
 }
 
 export async function updatePosition(id: string, updates: Partial<SniperPosition>): Promise<void> {
-  const { error } = await getSupabase()
-    .from('sniper_positions')
-    .update(updates)
-    .eq('id', id);
+  const maxRetries = 3;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    const { error } = await getSupabase()
+      .from('sniper_positions')
+      .update(updates)
+      .eq('id', id);
 
-  if (error) {
-    console.error('[Supabase] Error updating position:', error.message);
+    if (!error) return;
+
+    console.error(`[Supabase] updatePosition attempt ${attempt}/${maxRetries} failed for id=${id}:`, error.message);
+    if (attempt < maxRetries) {
+      await new Promise((r) => setTimeout(r, 1000 * attempt));
+    }
   }
 }
 
