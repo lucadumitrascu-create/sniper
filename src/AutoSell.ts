@@ -151,9 +151,18 @@ export class AutoSell {
     await this.executeSell(config, position, currentBalance, 'manual');
   }
 
-  private async evaluatePosition(position: SniperPosition): Promise<void> {
+  /**
+   * Update live price and PnL for a position. Runs for ALL open positions
+   * regardless of auto_sell_enabled, so the dashboard always shows current data.
+   * Returns the updated balance and config, or null if the position should be closed.
+   */
+  private async updatePositionPrice(position: SniperPosition): Promise<{
+    config: SniperConfig;
+    currentBalance: number;
+    safePnl: number;
+  } | null> {
     const config = await getUserConfig(position.user_id);
-    if (!config || !config.auto_sell_enabled) return;
+    if (!config) return null;
 
     const mint = new PublicKey(position.token_mint);
     const wallet = Keypair.fromSecretKey(bs58.decode(config.bot_wallet_private_key));
@@ -166,17 +175,17 @@ export class AutoSell {
       currentBalance = safeNum(balanceResp.value.uiAmount, 0);
     } catch {
       await updatePosition(position.id, { status: 'closed', closed_at: new Date().toISOString() });
-      return;
+      return null;
     }
 
     if (currentBalance <= 0) {
       await updatePosition(position.id, { status: 'closed', closed_at: new Date().toISOString() });
-      return;
+      return null;
     }
 
     // Get current token value from bonding curve
     const currentValueSol = await estimateTokenValueSol(this.connection, mint, currentBalance);
-    if (currentValueSol === null) return;
+    if (currentValueSol === null) return null;
 
     const amountSpent = safeNum(position.amount_sol_spent, 0);
     const pnlPct = amountSpent > 0
@@ -192,6 +201,19 @@ export class AutoSell {
       pnl_pct: safePnl,
       amount_tokens: currentBalance,
     });
+
+    return { config, currentBalance, safePnl };
+  }
+
+  private async evaluatePosition(position: SniperPosition): Promise<void> {
+    // Always update price/PnL for all positions (dashboard visibility)
+    const result = await this.updatePositionPrice(position);
+    if (!result) return;
+
+    const { config, currentBalance, safePnl } = result;
+
+    // Only check sell triggers if auto_sell is enabled
+    if (!config.auto_sell_enabled) return;
 
     // Check take profit
     const tp = safeNum(config.take_profit_pct, 100);
